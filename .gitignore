@@ -1,0 +1,53 @@
+*.csv
+*.png
+*.odt
+!examples/*.csv
+!examples/*.png
+
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+.env/
+.venv/
+
+# =========================
+# Outputs del proyecto
+# =========================
+outputs_*/
+outputs/
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# =========================
+# Logs y temporales
+# =========================
+*.log
+*.tmp
+*.bak
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
