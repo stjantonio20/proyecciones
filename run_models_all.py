@@ -619,6 +619,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
             preds_fut[name]  = np.zeros(len(future_idx), float)
             scores[name]     = 0.0
     else:
+        # ============ ETS ============
         if RUN_ETS:
             try:
                 yhat_test, yhat_fut = fit_predict_ets(y_train, test_len=len(y_test), h_future=H_FUTURE)
@@ -629,7 +630,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
                 print(f"[WARN] {codigo} ETS falló: {e}")
                 preds_test["ETS"] = None
                 preds_fut["ETS"]  = None
-
+        # ============ SARIMAX ============
         if RUN_SARIMAX:
             try:
                 yhat_test, yhat_fut = fit_predict_sarimax(y_train, test_len=len(y_test), h_future=H_FUTURE)
@@ -640,7 +641,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
                 print(f"[WARN] {codigo} SARIMAX falló: {e}")
                 preds_test["SARIMAX"] = None
                 preds_fut["SARIMAX"]  = None
-
+        # ============ LINEAR ============
         if RUN_LINEAR:
             try:
                 yhat_test, yhat_fut = fit_predict_tabular_model(
@@ -654,7 +655,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
                 print(f"[WARN] {codigo} Linear falló: {e}")
                 preds_test["Linear"] = None
                 preds_fut["Linear"]  = None
-
+        # ============ RIDGE ============
         if RUN_RIDGE:
             try:
                 yhat_test, yhat_fut = fit_predict_tabular_model(
@@ -668,7 +669,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
                 print(f"[WARN] {codigo} Ridge falló: {e}")
                 preds_test["Ridge"] = None
                 preds_fut["Ridge"]  = None
-
+        # ============ MLP ============
         if RUN_MLP:
             try:
                 yhat_test, yhat_fut = fit_predict_tabular_model(
@@ -682,7 +683,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
                 print(f"[WARN] {codigo} MLP falló: {e}")
                 preds_test["MLP"] = None
                 preds_fut["MLP"]  = None
-
+        # ============ HGB ============
         if RUN_HGB:
             try:
                 yhat_test, yhat_fut = fit_predict_tabular_model(
@@ -709,14 +710,14 @@ def run_for_codigo(codigo: str, s: pd.Series):
         Xtr, Ytr = X_all[train_mask], Y_all[train_mask]
         Xte, Yte = X_all[test_mask],  Y_all[test_mask]
         Xte, Yte = Xte[:len(y_test)], Yte[:len(y_test)]
-
+        # ============ (2) NNs ============
         ntr = len(Xtr)
         nval = max(10, int(0.1 * ntr))
         Xtrain, Ytrain = Xtr[:-nval], Ytr[:-nval]
         Xval,   Yval   = Xtr[-nval:], Ytr[-nval:]
 
         last_window = y_scaled_all[-LOOKBACK_NN:]
-
+        # ============ TCN ============
         if RUN_TCN:
             try:
                 m_tcn = build_tcn(LOOKBACK_NN)
@@ -735,7 +736,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
                 print(f"[WARN] {codigo} TCN falló: {e}")
                 preds_test["TCN"] = None
                 preds_fut["TCN"]  = None
-
+        # ============ LSTM ============
         if RUN_LSTM:
             try:
                 m_lstm = build_lstm(LOOKBACK_NN)
