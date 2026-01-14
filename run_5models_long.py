@@ -19,9 +19,22 @@ from typing import List
 # =========================================================
 # GPU config (TF)
 # =========================================================
+USE_GPU = True
+# ====== FORZAR CPU/GPU + desactivar XLA ======
+if USE_GPU:
+    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+else:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_enable_xla_devices=false"
+os.environ["XLA_FLAGS"] = ""
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # opcional (menos ruido / más determinista)
+
 def tf_configure_gpu():
     try:
         import tensorflow as tf
+        from tensorflow.keras import layers, models
         gpus = tf.config.list_physical_devices("GPU")
         if gpus:
             for gpu in gpus:
@@ -32,19 +45,7 @@ def tf_configure_gpu():
     except Exception as e:
         print(f"[TF] GPU config warning: {e}")
 
-# ====== FORZAR CPU/GPU + desactivar XLA ======
-USE_GPU = True  # <-- bandera
 
-if USE_GPU:
-    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-else:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-
-# logs + XLA off (reduce ruido y problemas)
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["TF_XLA_FLAGS"] = "--tf_xla_enable_xla_devices=false"
-os.environ["XLA_FLAGS"] = ""
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # opcional (menos ruido / más determinista)
 
 # configurar TF después de env vars
 if USE_GPU:
@@ -58,10 +59,10 @@ np.random.seed(24)
 # =========================================================
 # CONFIG
 # =========================================================
-CSV_PATH = "Crediguate_rampa_nuevo_diario_30x.csv"     # largo: codigo,fecha,valor
+CSV_PATH = "./dataset/CreNuevo_rampa_diario.csv"     # largo: codigo,fecha,valor
 OUT_DIR  = "outputs_long_intraday"
 
-ONLY_CODIGO = "101101"  # o None
+ONLY_CODIGO = None # o None
 #ONLY_CODIGO = ["101101","103101"]  # o None
 
 # ---- Frecuencia base (tu dataset es cada 48min) ----
@@ -69,20 +70,20 @@ BASE_FREQ = "48min"      # o None para inferir
 POINTS_PER_DAY_HINT = 30
 
 # Horizonte futuro
-FUTURE_DAYS = 30
+FUTURE_DAYS = 90
 
 # NNs
-LOOKBACK_NN = 210
-NN_EPOCHS   = 10
-NN_BATCH    = 64
-NN_PATIENCE = 8
+LOOKBACK_NN = 16 #210
+NN_EPOCHS   = 80
+NN_BATCH    = 20 #64
+NN_PATIENCE = 10 #8
 
 # Tabulares
 LAGS_TABULAR = 210
 
 # switches
 RUN_ETS          = True
-RUN_SARIMAX      = False
+RUN_SARIMAX      = True
 RUN_TCN          = True
 RUN_LSTM         = True
 RUN_MULTITASK_DL = True
@@ -98,7 +99,7 @@ RUN_LGBM         = True
 # NUEVO: ventana para ETS/SARIMAX si tardan
 # =========================================================
 # Si None => usa todo y_train
-ETS_TRAIN_LAST_DAYS    = 180   # pon 90/180/365; o None
+ETS_TRAIN_LAST_DAYS    = 360   # pon 90/180/365; o None
 SARIMAX_TRAIN_LAST_DAYS = 180  # pon 90/180/365; o None
 
 # =========================================================
@@ -141,6 +142,58 @@ def cleanup_memory(tag: str = ""):
 # =========================================================
 # Helpers generales
 # =========================================================
+def clip_by_history(x: np.ndarray, y_hist: pd.Series, q_low=0.001, q_high=0.999, mult=3.0):
+    """
+    Recorta x a un rango razonable derivado de la historia.
+    mult=3.0 => expande el rango para no recortar demasiado.
+    """
+    x = np.asarray(x, float).reshape(-1)
+
+    yh = y_hist.values.astype(float)
+    yh = yh[np.isfinite(yh)]
+    if yh.size < 100:
+        return x
+
+    lo = np.nanquantile(yh, q_low)
+    hi = np.nanquantile(yh, q_high)
+    iqr = hi - lo
+    if not np.isfinite(iqr) or iqr <= 0:
+        return x
+
+    lo2 = lo - mult * iqr
+    hi2 = hi + mult * iqr
+    return np.clip(x, lo2, hi2)
+
+def filter_reasonable_models_from_future(df_fut: pd.DataFrame, y_hist: pd.Series, ratio=30.0):
+    """
+    Usa tu drop_outlier_models pero además recorta valores absurdos
+    y construye una lista de columnas pred_* "buenas".
+    """
+    pred_cols = [c for c in df_fut.columns if c.startswith("pred_") and c != "pred_ENSEMBLE"]
+    preds = {c.replace("pred_", ""): df_fut[c].values for c in pred_cols}
+
+    # 1) elimina modelos con escala/picos absurdos
+    keep = drop_outlier_models(
+        y_ref=y_hist, preds=preds,
+        ratio=ratio, q_ref=0.95, q_pred=0.995
+    )
+    keep_cols = [f"pred_{m}" for m,v in keep.items() if v is not None and f"pred_{m}" in df_fut.columns]
+
+    # 2) CLIP (por si alguno se cuela “finito pero enorme”)
+    for c in keep_cols:
+        df_fut[c] = clip_by_history(df_fut[c].values, y_hist)
+
+    return keep_cols
+
+def add_robust_ensemble(df_fut: pd.DataFrame, keep_cols: list):
+    """
+    ENSEMBLE robusto: mediana (mejor que media cuando hay outliers).
+    """
+    if not keep_cols:
+        return
+    df_fut["pred_ENSEMBLE_MEDIAN"] = df_fut[keep_cols].median(axis=1)
+    df_fut["pred_ENSEMBLE_MEAN"]   = df_fut[keep_cols].mean(axis=1)
+
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
@@ -621,22 +674,33 @@ def build_lstm(input_len: int):
 
 def build_tcn(input_len: int):
     from tensorflow.keras import layers, models
+    import tensorflow as tf  # faltaba
     from tcn import TCN
+
     inp = layers.Input(shape=(input_len, 1))
     x = TCN(
         nb_filters=64,
         kernel_size=3,
-        dilations=[1, 2, 4, 8, 16, 32],
+        dilations=[1, 2, 4, 8, 16, 32, 64],
         padding="causal",
-        dropout_rate=0.2,
+        dropout_rate=0.15, #0.2
         return_sequences=False,
         use_skip_connections=True,
     )(inp)
+
+    x = layers.LayerNormalization()(x)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
     x = layers.Dense(16, activation="relu")(x)
     out = layers.Dense(1)(x)
+
     m = models.Model(inp, out)
-    m.compile(optimizer="adam", loss="mae")
+    m.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-3),
+        loss=tf.keras.losses.Huber(delta=1.0)
+    )
     return m
+
 
 def build_multitask_dl(input_len: int):
     from tensorflow.keras import layers, models
@@ -790,6 +854,345 @@ def plot_test_vs_pred_intraday(
     plt.ylabel("Valor")
     plt.grid(True, alpha=0.3)
     plt.legend(ncol=2, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def _downsample_series(s: pd.Series, max_points: int = 15000) -> pd.Series:
+    s = s.dropna()
+    if len(s) <= max_points:
+        return s
+    step = max(1, len(s) // max_points)
+    return s.iloc[::step]
+
+def plot_full_series_raw(
+    codigo: str,
+    y: pd.Series,
+    out_png: str,
+    max_points_plot: int = 20000
+):
+    """(1) Serie completa tal cual (sin preds)."""
+    plt.figure(figsize=(13, 5))
+    yp = _downsample_series(y, max_points_plot)
+    plt.plot(yp.index, yp.values, linewidth=1.8, label="Real intradía")
+    plt.title(f"Codigo {codigo} — Serie completa intradía (raw)")
+    plt.xlabel("Fecha")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+def plot_full_plus_future_intraday_only(
+    codigo: str,
+    y: pd.Series,
+    train_cut: pd.Timestamp,
+    df_fut: pd.DataFrame,
+    out_png: str,
+    max_points_plot: int = 20000,
+    plot_models: bool = True,
+    plot_ensemble: bool = True,
+):
+    """
+    (2) Serie completa + SOLO predicción intradía futura (sin test).
+    Si plot_models=True pinta todas las pred_*; si no, solo ENSEMBLE.
+    """
+    plt.figure(figsize=(13, 5))
+    yp = _downsample_series(y, max_points_plot)
+    plt.plot(yp.index, yp.values, linewidth=1.8, label="Real intradía")
+    plt.axvline(train_cut, linestyle="--", linewidth=1)
+
+    cols = [c for c in df_fut.columns if c.startswith("pred_")]
+    if not plot_models:
+        cols = ["pred_ENSEMBLE"] if "pred_ENSEMBLE" in df_fut.columns else []
+
+    if not plot_ensemble:
+        cols = [c for c in cols if c != "pred_ENSEMBLE"]
+
+    for c in cols:
+        sp = df_fut[c].dropna()
+        if sp.empty:
+            continue
+        sp = _downsample_series(sp, max_points_plot)
+        plt.plot(sp.index, sp.values, linewidth=1.0, label=c)
+
+    plt.title(f"Codigo {codigo} — Serie completa + forecast intradía (solo futuro)")
+    plt.xlabel("Fecha")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend(ncol=2, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+def _series_mode_rounded(x: pd.Series, mode_round: int = 2) -> float:
+    """Modo robusto con redondeo para floats."""
+    x = pd.to_numeric(x, errors="coerce").dropna()
+    if x.empty:
+        return np.nan
+    xr = x.round(mode_round)
+    vc = xr.value_counts()
+    if vc.empty:
+        return np.nan
+    return float(vc.idxmax())
+
+def plot_daily_median_and_monthly_mode_from_future(
+    codigo: str,
+    y: pd.Series,
+    train_cut: pd.Timestamp,
+    df_fut: pd.DataFrame,
+    out_png: str,
+    out_csv_daily: str,
+    out_csv_monthly: str,
+    use_col: str = "pred_ENSEMBLE",
+    mode_round: int = 2
+):
+    """
+    (3) Guarda:
+      - mediana diaria de las predicciones (futuro)
+      - modo (valor más frecuente) mensual de las predicciones (futuro)
+    y lo grafica junto con la serie original (agregada a diario/mensual para comparar).
+    """
+    if use_col not in df_fut.columns:
+        return
+
+    pred = df_fut[use_col].dropna()
+    if pred.empty:
+        return
+
+    # daily median (future)
+    pred_daily_median = pred.resample("D").median()
+
+    # monthly mode (future)
+    pred_monthly_mode = pred.resample("MS").apply(lambda s: _series_mode_rounded(s, mode_round=mode_round))
+
+    # guardar csv
+    pred_daily_median.rename("pred_daily_median").to_frame().reset_index().rename(columns={"index": "fecha"}).to_csv(out_csv_daily, index=False)
+    pred_monthly_mode.rename("pred_monthly_mode").to_frame().reset_index().rename(columns={"index": "mes"}).to_csv(out_csv_monthly, index=False)
+
+    # Para comparar con real, agregamos real a diario (median) y mensual (mode aproximado)
+    y_daily = y.resample("D").median()
+    y_month = y.resample("MS").apply(lambda s: _series_mode_rounded(s, mode_round=mode_round))
+
+    plt.figure(figsize=(13, 5))
+    plt.plot(y_daily.index, y_daily.values, linewidth=1.8, label="Real diario (mediana)")
+    plt.axvline(train_cut, linestyle="--", linewidth=1)
+
+    plt.plot(pred_daily_median.index, pred_daily_median.values, linewidth=1.2, label=f"{use_col} — mediana diaria (futuro)")
+    plt.plot(y_month.index, y_month.values, linewidth=1.5, label="Real mensual (modo aprox)", alpha=0.9)
+    plt.plot(pred_monthly_mode.index, pred_monthly_mode.values, linewidth=1.5, label=f"{use_col} — modo mensual (futuro)", alpha=0.9)
+
+    plt.title(f"Codigo {codigo} — Mediana diaria (futuro) + Modo mensual (futuro)")
+    plt.xlabel("Fecha")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend(ncol=2, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+def plot_monthly_max_from_future(
+    codigo: str,
+    y: pd.Series,
+    train_cut: pd.Timestamp,
+    df_fut: pd.DataFrame,
+    out_png: str,
+    out_csv: str,
+    use_col: str = "pred_ENSEMBLE"
+):
+    """(4) Mensual MAX de las proyecciones (futuro) junto con real mensual (max o last, aquí uso max real)."""
+    if use_col not in df_fut.columns:
+        return
+    pred = df_fut[use_col].dropna()
+    if pred.empty:
+        return
+
+    pred_month_max = pred.resample("MS").max()
+    y_month_max = y.resample("MS").max()
+
+    pred_month_max.rename("pred_monthly_max").to_frame().reset_index().rename(columns={"index": "mes"}).to_csv(out_csv, index=False)
+
+    plt.figure(figsize=(13, 5))
+    plt.plot(y_month_max.index, y_month_max.values, linewidth=2, label="Real mensual (MAX)")
+    plt.axvline(train_cut.to_period("M").start_time, linestyle="--", linewidth=1)
+    plt.plot(pred_month_max.index, pred_month_max.values, linewidth=2, label=f"{use_col} — mensual (MAX futuro)")
+    plt.title(f"Codigo {codigo} — Mensual MAX de proyecciones (futuro)")
+    plt.xlabel("Mes")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+def plot_monthly_bands_intrames(
+    codigo: str,
+    y: pd.Series,
+    train_cut: pd.Timestamp,
+    df_fut: pd.DataFrame,
+    out_png: str,
+    out_csv: str,
+    use_col: str = "pred_ENSEMBLE",
+    q_low: float = 0.10,
+    q_high: float = 0.90
+):
+    """
+    (5) Mensual con bandas intrames: mean + [p10, p90] de intradía (futuro),
+    junto con real mensual (mean).
+    """
+    if use_col not in df_fut.columns:
+        return
+    pred = df_fut[use_col].dropna()
+    if pred.empty:
+        return
+
+    # real mensual (mean)
+    y_month_mean = y.resample("MS").mean()
+
+    # futuro mensual (bandas)
+    pred_m_mean = pred.resample("MS").mean()
+    pred_m_low  = pred.resample("MS").quantile(q_low)
+    pred_m_high = pred.resample("MS").quantile(q_high)
+
+    df_out = pd.DataFrame({
+        "mes": pred_m_mean.index,
+        "pred_mean": pred_m_mean.values,
+        f"pred_q{int(q_low*100)}": pred_m_low.values,
+        f"pred_q{int(q_high*100)}": pred_m_high.values
+    })
+    df_out.to_csv(out_csv, index=False)
+
+    plt.figure(figsize=(13, 5))
+    plt.plot(y_month_mean.index, y_month_mean.values, linewidth=2, label="Real mensual (MEDIA)")
+    plt.axvline(train_cut.to_period("M").start_time, linestyle="--", linewidth=1)
+
+    plt.plot(pred_m_mean.index, pred_m_mean.values, linewidth=2, label=f"{use_col} — mensual (MEDIA futuro)")
+    plt.fill_between(pred_m_mean.index, pred_m_low.values, pred_m_high.values, alpha=0.2, label=f"Banda {int(q_low*100)}-{int(q_high*100)}% (futuro)")
+
+    plt.title(f"Codigo {codigo} — Mensual con banda intrames (futuro)")
+    plt.xlabel("Mes")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend(ncol=2, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+def plot_monthly_close_last(
+    codigo: str,
+    y: pd.Series,
+    train_cut: pd.Timestamp,
+    df_fut: pd.DataFrame,
+    out_png: str,
+    out_csv: str = None,
+    use_col: str = "pred_ENSEMBLE"
+):
+    if use_col not in df_fut.columns:
+        return
+    pred = df_fut[use_col].dropna()
+    if pred.empty:
+        return
+
+    y_month_last = y.resample("MS").last()
+    pred_month_last = pred.resample("MS").last()
+
+    if out_csv is not None:  # ✅ FIX
+        pd.DataFrame({
+            "mes": pred_month_last.index,
+            "pred_month_last": pred_month_last.values
+        }).to_csv(out_csv, index=False)
+
+    plt.figure(figsize=(13, 5))
+    plt.plot(y_month_last.index, y_month_last.values, linewidth=2, label="Real mensual (CIERRE/LAST)")
+    plt.axvline(train_cut.to_period("M").start_time, linestyle="--", linewidth=1)
+    plt.plot(pred_month_last.index, pred_month_last.values, linewidth=2, label=f"{use_col} — cierre mensual (futuro)")
+    plt.title(f"Codigo {codigo} — Cierre de mes (LAST) vs proyección")
+    plt.xlabel("Mes")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+
+
+def plot_full_raw(codigo: str, y: pd.Series, out_png: str, max_points_plot=20000):
+    plt.figure(figsize=(13,5))
+    yp = y
+    if len(yp) > max_points_plot:
+        step = max(1, len(yp)//max_points_plot)
+        yp = yp.iloc[::step]
+    plt.plot(yp.index, yp.values, label="Real (raw)", linewidth=1.5)
+    plt.title(f"Codigo {codigo} — Serie completa (raw)")
+    plt.xlabel("Fecha")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+
+def plot_full_plus_forecast_intraday_ensemble(codigo, y, train_cut, df_fut, out_png, col="pred_ENSEMBLE"):
+    plt.figure(figsize=(13,5))
+    plt.plot(y.index, y.values, label="Real", linewidth=1.6)
+    plt.axvline(train_cut, linestyle="--", linewidth=1)
+
+    if col in df_fut.columns:
+        plt.plot(df_fut.index, df_fut[col].values, label=f"{col} (forecast intradía)", linewidth=1.2)
+
+    plt.title(f"Codigo {codigo} — Serie completa + forecast intradía ({col})")
+    plt.xlabel("Fecha")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+
+def monthly_mode_from_daily(series_daily: pd.Series, decimals=0) -> pd.Series:
+    # modo mensual usando redondeo para hacer bins
+    sd = series_daily.dropna()
+    if sd.empty:
+        return sd
+    s_round = sd.round(decimals)
+    def _mode(x):
+        vc = x.value_counts()
+        return vc.index[0] if len(vc) else np.nan
+    return s_round.resample("MS").apply(_mode)
+
+def plot_daily_median_and_monthly_mode(codigo, y, df_fut, train_cut, out_png, col="pred_ENSEMBLE", mode_decimals=0):
+    # Real diario (mediana intradía del día)
+    y_day = y.resample("D").median()
+
+    # Futuro: mediana diaria de predicción
+    if col not in df_fut.columns:
+        return
+    p_day_median = df_fut[col].resample("D").median()
+
+    # Modo mensual de esa mediana diaria
+    p_month_mode = monthly_mode_from_daily(p_day_median, decimals=mode_decimals)
+
+    plt.figure(figsize=(13,5))
+    plt.plot(y_day.index, y_day.values, label="Real (mediana diaria)", linewidth=1.7)
+    plt.axvline(train_cut, linestyle="--", linewidth=1)
+
+    plt.plot(p_day_median.index, p_day_median.values, label=f"{col} (mediana diaria futuro)", linewidth=1.2)
+    plt.plot(p_month_mode.index, p_month_mode.values, label=f"{col} (MODO mensual de mediana diaria)", linewidth=2.0)
+
+    plt.title(f"Codigo {codigo} — Mediana diaria + modo mensual (desde intradía)")
+    plt.xlabel("Fecha")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(out_png, dpi=150)
     plt.close()
@@ -1084,49 +1487,62 @@ def plot_monthly_from_intraday_preds(
     out_png_mean: str,
     out_png_median: str
 ):
-    """
-    (C) mensual (MEDIA) y (D) mensual (MEDIANA)
-    - Real mensual se calcula con resample("MS").mean()
-    - Pred mensual:
-        * mean: resample("MS").mean()
-        * median: resample("MS").median()
-    """
-    # Real mensual (promedio)
+    # Asegurar DatetimeIndex
+    y = y.copy()
+    y.index = pd.DatetimeIndex(y.index)
+
+    df = df_fut_intraday.copy()
+    df.index = pd.DatetimeIndex(df.index)
+
+    # Real mensual
     y_month = y.resample("MS").mean()
 
-    # Solo columnas pred_
-    pred_cols = [c for c in df_fut_intraday.columns if c.startswith("pred_")]
+    # columnas pred_
+    pred_cols = [c for c in df.columns if c.startswith("pred_")]
     if not pred_cols:
-        return
+        raise ValueError("No hay columnas pred_ en df_fut_intraday")
 
-    # ---- filtrar outliers antes de bajar a mensual (clave) ----
-    preds_future = {c.replace("pred_", ""): df_fut_intraday[c].values for c in pred_cols}
+    # limpiar predicciones (por si acaso)
+    for c in pred_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        df[c] = df[c].interpolate(limit_direction="both").ffill().bfill()
+
+    # filtrar outliers (si quieres)
+    preds_future = {c.replace("pred_", ""): df[c].values for c in pred_cols}
     pf = drop_outlier_models(y_ref=y, preds=preds_future, ratio=30.0, q_ref=0.95, q_pred=0.995)
-    keep_cols = [f"pred_{m}" for m,v in pf.items() if v is not None and f"pred_{m}" in df_fut_intraday.columns]
-
+    keep_cols = [f"pred_{m}" for m, v in pf.items() if v is not None and f"pred_{m}" in df.columns]
 
     if not keep_cols:
-        return
+        raise ValueError("Después del filtro outlier no quedó ningún modelo para graficar.")
 
-    df_keep = df_fut_intraday[keep_cols].copy()
+    df_keep = df[keep_cols].copy()
 
-    # ---------- MEDIA mensual ----------
-    start_m = df_keep.index.min().to_period("M").start_time
-    end_m   = df_keep.index.max().to_period("M").start_time
+    # índice mensual futuro (seguro)
+    start_m = pd.Timestamp(df_keep.index.min()).to_period("M").start_time
+    end_m   = pd.Timestamp(df_keep.index.max()).to_period("M").start_time
+    if pd.isna(start_m) or pd.isna(end_m):
+        raise ValueError("start_m/end_m salió NaT")
 
-    df_month_mean = pd.DataFrame(index=pd.date_range(start_m, end_m, freq="MS"))
+    month_idx = pd.date_range(start=start_m, end=end_m, freq="MS")
+    if len(month_idx) == 0:
+        raise ValueError("month_idx quedó vacío")
 
+    # ----- MEDIA -----
+    df_month_mean = pd.DataFrame(index=month_idx)
     for c in keep_cols:
-        df_month_mean[c] = df_keep[c].resample("MS").mean()
+        s = df_keep[c].dropna()
+        df_month_mean[c] = s.resample("MS").mean().reindex(month_idx)
 
-    # ensemble (media de modelos)
+    # ensemble mean
     df_month_mean["pred_ENSEMBLE"] = df_month_mean[keep_cols].mean(axis=1)
 
     plt.figure(figsize=(13, 5))
     plt.plot(y_month.index, y_month.values, label="Real mensual (promedio)", linewidth=2)
-    plt.axvline(train_cut.to_period("M").to_timestamp("MS"), linestyle="--", linewidth=1)
+    plt.axvline(train_cut.to_period("M").start_time, linestyle="--", linewidth=1)
 
     for c in df_month_mean.columns:
+        if df_month_mean[c].notna().sum() == 0:
+            continue
         plt.plot(df_month_mean.index, df_month_mean[c].values, label=c)
 
     plt.title(f"Codigo {codigo} — Mensual (MEDIA) desde intradía")
@@ -1138,18 +1554,22 @@ def plot_monthly_from_intraday_preds(
     plt.savefig(out_png_mean, dpi=150)
     plt.close()
 
-    # ---------- MEDIANA mensual ----------
-    df_month_median = pd.DataFrame(index=df_month_mean.index)
+    # ----- MEDIANA -----
+    df_month_median = pd.DataFrame(index=month_idx)
     for c in keep_cols:
-        df_month_median[c] = df_keep[c].resample("MS").median()
+        s = df_keep[c].dropna()
+        df_month_median[c] = s.resample("MS").median().reindex(month_idx)
+
+    # ensemble median
     df_month_median["pred_ENSEMBLE"] = df_month_median[keep_cols].median(axis=1)
 
     plt.figure(figsize=(13, 5))
     plt.plot(y_month.index, y_month.values, label="Real mensual (promedio)", linewidth=2)
     plt.axvline(train_cut.to_period("M").start_time, linestyle="--", linewidth=1)
 
-
     for c in df_month_median.columns:
+        if df_month_median[c].notna().sum() == 0:
+            continue
         plt.plot(df_month_median.index, df_month_median[c].values, label=c)
 
     plt.title(f"Codigo {codigo} — Mensual (MEDIANA) desde intradía")
@@ -1161,6 +1581,71 @@ def plot_monthly_from_intraday_preds(
     plt.savefig(out_png_median, dpi=150)
     plt.close()
 
+def plot_monthly_max_future(codigo, y, df_fut, train_cut, out_png, col="pred_ENSEMBLE"):
+    y_m_max = y.resample("MS").max()
+    if col not in df_fut.columns:
+        return
+    p_m_max = df_fut[col].resample("MS").max()
+
+    plt.figure(figsize=(13,5))
+    plt.plot(y_m_max.index, y_m_max.values, label="Real mensual (MAX)", linewidth=2)
+    plt.axvline(train_cut.to_period("M").start_time, linestyle="--", linewidth=1)
+    plt.plot(p_m_max.index, p_m_max.values, label=f"{col} — mensual (MAX futuro)", linewidth=2)
+
+    plt.title(f"Codigo {codigo} — Mensual MAX (real vs futuro)")
+    plt.xlabel("Mes")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+def plot_monthly_with_intramonth_bands(codigo, y, df_fut, train_cut, out_png, col="pred_ENSEMBLE", qlo=0.10, qhi=0.90):
+    y_m_mean = y.resample("MS").mean()
+    if col not in df_fut.columns:
+        return
+
+    p_m_mean = df_fut[col].resample("MS").mean()
+    p_m_qlo  = df_fut[col].resample("MS").quantile(qlo)
+    p_m_qhi  = df_fut[col].resample("MS").quantile(qhi)
+
+    plt.figure(figsize=(13,5))
+    plt.plot(y_m_mean.index, y_m_mean.values, label="Real mensual (MEDIA)", linewidth=2)
+    plt.axvline(train_cut.to_period("M").start_time, linestyle="--", linewidth=1)
+
+    plt.plot(p_m_mean.index, p_m_mean.values, label=f"{col} — mensual (MEDIA futuro)", linewidth=2)
+    plt.fill_between(p_m_mean.index, p_m_qlo.values, p_m_qhi.values, alpha=0.2, label=f"Banda {int(qlo*100)}-{int(qhi*100)}% (futuro)")
+
+    plt.title(f"Codigo {codigo} — Mensual con banda intrames (futuro)")
+    plt.xlabel("Mes")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+def plot_monthly_close_last_SIMPLE(codigo, y, df_fut, train_cut, out_png, col="pred_ENSEMBLE"):
+
+    y_last = y.resample("MS").last()
+    if col not in df_fut.columns:
+        return
+    p_last = df_fut[col].resample("MS").last()
+
+    plt.figure(figsize=(13,5))
+    plt.plot(y_last.index, y_last.values, label="Real mensual (CIERRE/LAST)", linewidth=2)
+    plt.axvline(train_cut.to_period("M").start_time, linestyle="--", linewidth=1)
+    plt.plot(p_last.index, p_last.values, label=f"{col} — cierre mensual (futuro)", linewidth=2)
+
+    plt.title(f"Codigo {codigo} — Cierre de mes (LAST) vs proyección")
+    plt.xlabel("Mes")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
 
 
 # =========================================================
@@ -1194,6 +1679,67 @@ def intraday_series(df_long: pd.DataFrame, codigo: str, base_freq: str) -> pd.Se
 # CORE
 # =========================================================
 def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
+    """
+    Corre modelos intradía para un código, guarda:
+    - plot test vs pred (intradía)
+    - plot serie completa + pred futuro intradía
+    - plots mensuales (mean/median) desde intradía
+    - exports wide mensuales
+    - NUEVAS gráficas (1..6) usando pred_ENSEMBLE robusto
+    """
+
+    # =========================================================
+    # Helpers (si ya las tienes en otro lado, puedes borrar estas)
+    # =========================================================
+    def _safe_quantile(arr: np.ndarray, q: float):
+        arr = np.asarray(arr, float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return np.nan
+        return float(np.quantile(arr, q))
+
+    def drop_outlier_models(
+        y_ref: pd.Series,
+        preds: Dict[str, np.ndarray],
+        ratio: float = 30.0,
+        q_ref: float = 0.95,
+        q_pred: float = 0.995,
+    ) -> Dict[str, Optional[np.ndarray]]:
+        """
+        Filtro simple: elimina modelos cuya escala se dispara vs histórico.
+        Compara cuantiles (no máximos) para evitar picos.
+        """
+        yv = np.asarray(y_ref.values, float)
+        ref_q = _safe_quantile(yv, q_ref)
+        if not np.isfinite(ref_q) or ref_q == 0:
+            # fallback: usa mediana
+            ref_q = _safe_quantile(yv, 0.50)
+
+        kept: Dict[str, Optional[np.ndarray]] = {}
+        for name, arr in preds.items():
+            if arr is None:
+                kept[name] = None
+                continue
+            a = np.asarray(arr, float).reshape(-1)
+            qv = _safe_quantile(a, q_pred)
+            if not np.isfinite(qv):
+                kept[name] = None
+                continue
+
+            # Si el ref_q es muy pequeño, solo revisa que no sea absurdamente grande
+            if abs(ref_q) < 1e-9:
+                kept[name] = None if abs(qv) > 1e6 else a
+                continue
+
+            if abs(qv) > ratio * abs(ref_q):
+                kept[name] = None
+            else:
+                kept[name] = a
+        return kept
+
+    # =========================================================
+    # (0) Preparación
+    # =========================================================
     y = y.dropna().astype(float)
     if len(y) < (max(LOOKBACK_NN, LAGS_TABULAR) + 500):
         print(f"[SKIP] {codigo}: serie muy corta (n={len(y)})")
@@ -1238,11 +1784,15 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
 
     model_names_all = ["ETS","SARIMAX","TCN","LSTM","DL_MultiTask","Linear","Ridge","Lasso","MLP","HGB","LGBM"]
 
+    # =========================================================
+    # (1) Modelado
+    # =========================================================
     if all_zero:
         for name in model_names_all:
             preds_test[name] = pd.Series(np.zeros(test_len, float), index=test_idx)
             preds_fut[name]  = np.zeros(len(future_idx), float)
             scores[name]     = 0.0
+
     else:
         # ETS
         if RUN_ETS:
@@ -1308,7 +1858,7 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
         if RUN_HGB:    try_tab("HGB")
         if RUN_LGBM:   try_tab("LGBM", key="LGBM")
 
-        # NNs
+        # NNs (asinh scaler + supervised)
         sc = fit_asinh_scaler(y_train.values)
         y_scaled_all = transform_asinh(y.values, sc)
 
@@ -1322,6 +1872,7 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
         Xte_all = X_all[test_mask]
         test_idx_nn_all = target_idx[test_mask]
 
+        # alineamos a test_len
         Xte = Xte_all[:test_len]
         test_idx_nn = test_idx_nn_all[:test_len]
 
@@ -1432,7 +1983,10 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
 
                 preds_test["DL_MultiTask"] = as_series(yhat_test, test_idx_nn)
                 preds_fut["DL_MultiTask"]  = yhat_fut
-                scores["DL_MultiTask"] = rmse(y.loc[preds_test["DL_MultiTask"].index].values, preds_test["DL_MultiTask"].values)
+                scores["DL_MultiTask"] = rmse(
+                    y.loc[preds_test["DL_MultiTask"].index].values,
+                    preds_test["DL_MultiTask"].values
+                )
             except Exception as e:
                 print(f"[WARN] {codigo} MultiTask DL falló: {e}")
                 preds_test["DL_MultiTask"] = None
@@ -1445,10 +1999,13 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
     for name, r in scored:
         print(f"  {name:14s} RMSE_test = {r:,.4f}")
 
+    # =========================================================
+    # (2) Salidas por código
+    # =========================================================
     out_c_dir = os.path.join(OUT_DIR, f"codigo_{codigo}")
     ensure_dir(out_c_dir)
 
-    # --- (B) TEST vs PRED intradía (estricto) ---
+    # (B) TEST vs PRED intradía
     out_png_test = os.path.join(out_c_dir, f"plot_test_vs_pred_intraday_{codigo}.png")
     plot_test_vs_pred_intraday_strict(
         codigo=codigo,
@@ -1459,7 +2016,9 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
     )
     print(f"[OK] guardado TEST plot: {out_png_test}")
 
-    # --------- Guardar CSV intradía (futuro) por modelo + ensemble ----------
+    # =========================================================
+    # (3) Construir df_fut y ENSEMBLE ROBUSTO (CLAVE)
+    # =========================================================
     df_fut = pd.DataFrame(index=future_idx)
     for name, arr in preds_fut.items():
         if arr is None:
@@ -1467,19 +2026,62 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
         arr = np.asarray(arr, float).reshape(-1)
         df_fut[f"pred_{name}"] = pd.Series(arr[:len(future_idx)], index=future_idx)
 
-    pred_cols = [c for c in df_fut.columns if c.startswith("pred_")]
-    if pred_cols:
-        # ojo: aquí NO filtramos aún; filtramos al graficar para no perder csv
-        df_fut["pred_ENSEMBLE"] = df_fut[pred_cols].mean(axis=1)
+    pred_model_cols = [c for c in df_fut.columns if c.startswith("pred_") and c != "pred_ENSEMBLE"]
 
+    # limpieza base
+    for c in pred_model_cols:
+        df_fut[c] = pd.to_numeric(df_fut[c], errors="coerce")
+        df_fut[c] = df_fut[c].replace([np.inf, -np.inf], np.nan)
+        if df_fut[c].notna().sum() > 10:
+            df_fut[c] = df_fut[c].interpolate(limit_direction="both").ffill().bfill()
+
+    # clip a rango histórico (evita 1e296 finito)
+    hist_q01 = y.quantile(0.01)
+    hist_q99 = y.quantile(0.99)
+    iqr = hist_q99 - hist_q01
+    lo = hist_q01 - 3 * iqr
+    hi = hist_q99 + 3 * iqr
+    if np.isfinite(lo) and np.isfinite(hi) and lo < hi:
+        for c in pred_model_cols:
+            df_fut[c] = df_fut[c].clip(lo, hi)
+
+    # filtrado por escala + ensemble robusto
+    if pred_model_cols:
+        preds_dict = {c.replace("pred_", ""): df_fut[c].values for c in pred_model_cols}
+        keep = drop_outlier_models(y_ref=y, preds=preds_dict, ratio=30.0, q_ref=0.95, q_pred=0.995)
+        keep_cols = [f"pred_{m}" for m, v in keep.items() if v is not None and f"pred_{m}" in df_fut.columns]
+
+        if keep_cols:
+            df_fut["pred_ENSEMBLE_MEDIAN"] = df_fut[keep_cols].median(axis=1)
+            df_fut["pred_ENSEMBLE_MEAN"]   = df_fut[keep_cols].mean(axis=1)
+            df_fut["pred_ENSEMBLE"]        = df_fut["pred_ENSEMBLE_MEDIAN"]  # ✅ USAR ESTE
+        else:
+            df_fut["pred_ENSEMBLE"] = df_fut[pred_model_cols].median(axis=1)
+    else:
+        # si no hay modelos, deja vacío (pero no debería pasar)
+        pass
+
+    # logs de sanidad
+    if pred_model_cols:
+        print("NaN ratio por modelo (futuro):")
+        print(df_fut[pred_model_cols].isna().mean().sort_values(ascending=False).head(20))
+        print("\nConteo de finitos por modelo:")
+        print(np.isfinite(df_fut[pred_model_cols].values).sum(axis=0))
+
+    # guardar CSV futuro intradía
     out_csv_future = os.path.join(out_c_dir, f"future_intraday_{codigo}.csv")
     df_fut.reset_index().rename(columns={"index": "fecha"}).to_csv(out_csv_future, index=False)
     print(f"[OK] guardado: {out_csv_future}")
 
-    # --- (A) Serie completa + forecast intradía (estricto) ---
+    # =========================================================
+    # (A) Serie completa + forecast intradía (solo futuro)
+    # =========================================================
     out_png_forecast_only = os.path.join(out_c_dir, f"plot_forecast_only_{codigo}.png")
-    # armar dict simple de predicciones futuras desde df_fut (incluye pred_*)
-    preds_future_for_plot = {c.replace("pred_", ""): df_fut[c].values for c in pred_cols if c in df_fut.columns}
+    preds_future_for_plot = {
+        c.replace("pred_", ""): df_fut[c].values
+        for c in pred_model_cols
+        if c in df_fut.columns
+    }
     plot_forecast_only_intraday(
         codigo=codigo,
         y=y,
@@ -1490,10 +2092,11 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
     )
     print(f"[OK] guardado forecast-only: {out_png_forecast_only}")
 
-    # --- (C) y (D) Mensual: MEDIA y MEDIANA ---
+    # =========================================================
+    # (C) y (D) Mensual: MEDIA y MEDIANA desde intradía (usando df_fut ya saneado)
+    # =========================================================
     out_png_month_mean   = os.path.join(out_c_dir, f"plot_monthly_MEAN_{codigo}.png")
     out_png_month_median = os.path.join(out_c_dir, f"plot_monthly_MEDIAN_{codigo}.png")
-
     try:
         plot_monthly_from_intraday_preds(
             codigo=codigo,
@@ -1509,10 +2112,8 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
         print(f"[WARN] {codigo}: no pude generar plots mensuales: {e}")
 
     # =========================================================
-    # ELEGIR MEJOR MODELO POR RMSE (solo los que sí tienen score finito y preds)
+    # (4) Elegir mejor modelo por RMSE (con fallback a ENSEMBLE robusto)
     # =========================================================
-    # scores: dict(model -> rmse)
-    # df_fut: columnas pred_<MODEL>
     candidates = []
     for name, r in scores.items():
         if not np.isfinite(r):
@@ -1526,17 +2127,15 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
         candidates.sort(key=lambda x: x[1])
         best_model = candidates[0][0]
     else:
-        # fallback: si no hay scores, usa ENSEMBLE si existe
         if "pred_ENSEMBLE" in df_fut.columns:
             best_model = "ENSEMBLE"
 
-    # guarda un txt opcional con el mejor modelo
     if best_model is not None:
         with open(os.path.join(out_c_dir, f"best_model_{codigo}.txt"), "w", encoding="utf-8") as f:
             f.write(f"{best_model}\n")
 
     # =========================================================
-    # EXPORT WIDE MENSUAL POR MODELO (MEDIA y MEDIANA) - POR CÓDIGO
+    # (5) EXPORT WIDE mensual por modelo (mean/median)
     # =========================================================
     df_wide_mean = monthly_wide_per_model_from_future(codigo, df_fut, agg="mean")
     df_wide_median = monthly_wide_per_model_from_future(codigo, df_fut, agg="median")
@@ -1557,14 +2156,95 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
         print(f"[WARN] {codigo}: no pude crear WIDE mensual MEDIAN (sin predicciones)")
 
     # =========================================================
-    # DEVOLVER INFO PARA EL CSV GLOBAL (best model por código)
+    # (6) NUEVAS GRAFICAS (1..6) — usa pred_ENSEMBLE ROBUSTO
+    # =========================================================
+    out_png_raw = os.path.join(out_c_dir, f"plot_full_raw_{codigo}.png")
+    plot_full_series_raw(codigo=codigo, y=y, out_png=out_png_raw)
+    print(f"[OK] guardado serie raw: {out_png_raw}")
+
+    out_png_full_plus_future = os.path.join(out_c_dir, f"plot_full_plus_future_intraday_{codigo}.png")
+    plot_full_plus_future_intraday_only(
+        codigo=codigo,
+        y=y,
+        train_cut=train_cut,
+        df_fut=df_fut,
+        out_png=out_png_full_plus_future,
+        plot_models=False,       # recomiendo False para no saturar
+        plot_ensemble=True
+    )
+    print(f"[OK] guardado serie + futuro intradía: {out_png_full_plus_future}")
+
+    # (3) mediana diaria + modo mensual
+    out_png_daily_median_month_mode = os.path.join(out_c_dir, f"plot_daily_median_and_monthly_mode_{codigo}.png")
+    out_csv_daily_median = os.path.join(out_c_dir, f"future_daily_median_{codigo}.csv")
+    out_csv_month_mode = os.path.join(out_c_dir, f"future_monthly_mode_{codigo}.csv")
+    plot_daily_median_and_monthly_mode_from_future(
+        codigo=codigo,
+        y=y,
+        train_cut=train_cut,
+        df_fut=df_fut,
+        out_png=out_png_daily_median_month_mode,
+        out_csv_daily=out_csv_daily_median,
+        out_csv_monthly=out_csv_month_mode,
+        use_col="pred_ENSEMBLE",
+        mode_round=2
+    )
+    print(f"[OK] guardado daily median + monthly mode: {out_png_daily_median_month_mode}")
+
+    # (4) mensual MAX futuro
+    out_png_month_max = os.path.join(out_c_dir, f"plot_monthly_MAX_future_{codigo}.png")
+    out_csv_month_max = os.path.join(out_c_dir, f"future_monthly_MAX_{codigo}.csv")
+    plot_monthly_max_from_future(
+        codigo=codigo,
+        y=y,
+        train_cut=train_cut,
+        df_fut=df_fut,
+        out_png=out_png_month_max,
+        out_csv=out_csv_month_max,
+        use_col="pred_ENSEMBLE"
+    )
+    print(f"[OK] guardado mensual MAX futuro: {out_png_month_max}")
+
+    # (5) bandas intrames (p10-p90) + mean
+    out_png_bands = os.path.join(out_c_dir, f"plot_monthly_BANDS_{codigo}.png")
+    out_csv_bands = os.path.join(out_c_dir, f"future_monthly_BANDS_{codigo}.csv")
+    plot_monthly_bands_intrames(
+        codigo=codigo,
+        y=y,
+        train_cut=train_cut,
+        df_fut=df_fut,
+        out_png=out_png_bands,
+        out_csv=out_csv_bands,
+        use_col="pred_ENSEMBLE",
+        q_low=0.10,
+        q_high=0.90
+    )
+    print(f"[OK] guardado bandas intrames: {out_png_bands}")
+
+    # (6) cierre de mes (LAST)
+    out_png_close = os.path.join(out_c_dir, f"plot_monthly_CLOSE_LAST_{codigo}.png")
+    out_csv_close = os.path.join(out_c_dir, f"future_monthly_CLOSE_LAST_{codigo}.csv")
+    plot_monthly_close_last(
+        codigo=codigo,
+        y=y,
+        train_cut=train_cut,
+        df_fut=df_fut,
+        out_png=out_png_close,
+        out_csv=out_csv_close,
+        use_col="pred_ENSEMBLE"
+    )
+    print(f"[OK] guardado cierre mensual (LAST): {out_png_close}")
+
+    # =========================================================
+    # Devolver
     # =========================================================
     return {
         "codigo": str(codigo),
         "best_model": best_model,
-        "df_fut": df_fut,   # por si quieres usarlo en main
+        "df_fut": df_fut,
         "scores": scores
     }
+
 
 
 # =========================================================
