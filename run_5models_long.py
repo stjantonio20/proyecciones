@@ -70,13 +70,13 @@ BASE_FREQ = "48min"      # o None para inferir
 POINTS_PER_DAY_HINT = 30
 
 # Horizonte futuro
-FUTURE_DAYS = 90
+FUTURE_DAYS = 180
 
 # NNs
 LOOKBACK_NN = 16 #210
 NN_EPOCHS   = 80
-NN_BATCH    = 20 #64
-NN_PATIENCE = 10 #8
+NN_BATCH    = 24 #64
+NN_PATIENCE = 12 #8
 
 # Tabulares
 LAGS_TABULAR = 210
@@ -505,17 +505,32 @@ def tabular_forecast_autoreg(model, y_full: pd.Series, lags: int, future_idx: pd
     yv = y_full.values.astype(float)
     buf = apply_tabular_transform(yv).tolist()
 
+    #  límites en espacio ORIGINAL (antes de transform)
+    yh = y_full.values.astype(float)
+    yh = yh[np.isfinite(yh)]
+    q01, q99 = np.quantile(yh, 0.01), np.quantile(yh, 0.99)
+    iqr = q99 - q01
+    lo, hi = q01 - 3*iqr, q99 + 3*iqr
+
     preds_t = []
     for ts in future_idx:
         l = np.array(buf[-lags:], float)
-        tf = time_features(pd.DatetimeIndex([ts])).ravel()
-        feats = np.r_[l, tf].reshape(1, -1)
+        tfv = time_features(pd.DatetimeIndex([ts])).ravel()
+        feats = np.r_[l, tfv].reshape(1, -1)
         y_next_t = float(model.predict(feats)[0])
-        preds_t.append(y_next_t)
-        buf.append(y_next_t)
 
-    preds_t = np.asarray(preds_t, float)
-    return invert_tabular_transform(preds_t)
+        # invertimos para clip en escala real
+        y_next = float(invert_tabular_transform(np.array([y_next_t]))[0])
+        if np.isfinite(lo) and np.isfinite(hi) and lo < hi:
+            y_next = float(np.clip(y_next, lo, hi))
+
+        preds_t.append(y_next)
+
+        # volvemos a transform para alimentar el buffer
+        buf.append(float(apply_tabular_transform(np.array([y_next]))[0]))
+
+    return np.asarray(preds_t, float)
+
 
 def fit_predict_tabular_model(
     codigo: str,
@@ -970,7 +985,7 @@ def plot_daily_median_and_monthly_mode_from_future(
     pred_daily_median = pred.resample("D").median()
 
     # monthly mode (future)
-    pred_monthly_mode = pred.resample("MS").apply(lambda s: _series_mode_rounded(s, mode_round=mode_round))
+    pred_monthly_mode = pred_daily_median.resample("MS").apply(lambda s: _series_mode_rounded(s, mode_round=mode_round))
 
     # guardar csv
     pred_daily_median.rename("pred_daily_median").to_frame().reset_index().rename(columns={"index": "fecha"}).to_csv(out_csv_daily, index=False)
@@ -978,7 +993,7 @@ def plot_daily_median_and_monthly_mode_from_future(
 
     # Para comparar con real, agregamos real a diario (median) y mensual (mode aproximado)
     y_daily = y.resample("D").median()
-    y_month = y.resample("MS").apply(lambda s: _series_mode_rounded(s, mode_round=mode_round))
+    y_month = y_daily.resample("MS").apply(lambda s: _series_mode_rounded(s, mode_round=mode_round))
 
     plt.figure(figsize=(13, 5))
     plt.plot(y_daily.index, y_daily.values, linewidth=1.8, label="Real diario (mediana)")
@@ -1196,6 +1211,43 @@ def plot_daily_median_and_monthly_mode(codigo, y, df_fut, train_cut, out_png, co
     plt.tight_layout()
     plt.savefig(out_png, dpi=150)
     plt.close()
+
+def plot_monthly_close_last_from_daily_median(
+    codigo: str,
+    y: pd.Series,
+    train_cut: pd.Timestamp,
+    df_fut: pd.DataFrame,
+    out_png: str,
+    out_csv: str = None,
+    use_col: str = "pred_ENSEMBLE"
+):
+    if use_col not in df_fut.columns:
+        return
+
+    # REAL: intradía -> diario(mediana) -> mensual(last)
+    y_daily = y.resample("D").median()
+    y_month_close = y_daily.resample("MS").last()
+
+    # PRED: intradía -> diario(mediana) -> mensual(last)
+    p_daily = df_fut[use_col].resample("D").median()
+    p_month_close = p_daily.resample("MS").last()
+
+    if out_csv is not None:
+        pd.DataFrame({"mes": p_month_close.index, "pred_close_last": p_month_close.values}).to_csv(out_csv, index=False)
+
+    plt.figure(figsize=(13,5))
+    plt.plot(y_month_close.index, y_month_close.values, linewidth=2, label="Real mensual (CIERRE desde diario-mediana)")
+    plt.axvline(train_cut.to_period("M").start_time, linestyle="--", linewidth=1)
+    plt.plot(p_month_close.index, p_month_close.values, linewidth=2, label=f"{use_col} — cierre mensual (desde diario-mediana)")
+    plt.title(f"Codigo {codigo} — Cierre mensual consistente (diario→mensual)")
+    plt.xlabel("Mes")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
 
 
 # =========================================================
@@ -1689,55 +1741,6 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
     """
 
     # =========================================================
-    # Helpers (si ya las tienes en otro lado, puedes borrar estas)
-    # =========================================================
-    def _safe_quantile(arr: np.ndarray, q: float):
-        arr = np.asarray(arr, float)
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0:
-            return np.nan
-        return float(np.quantile(arr, q))
-
-    def drop_outlier_models(
-        y_ref: pd.Series,
-        preds: Dict[str, np.ndarray],
-        ratio: float = 30.0,
-        q_ref: float = 0.95,
-        q_pred: float = 0.995,
-    ) -> Dict[str, Optional[np.ndarray]]:
-        """
-        Filtro simple: elimina modelos cuya escala se dispara vs histórico.
-        Compara cuantiles (no máximos) para evitar picos.
-        """
-        yv = np.asarray(y_ref.values, float)
-        ref_q = _safe_quantile(yv, q_ref)
-        if not np.isfinite(ref_q) or ref_q == 0:
-            # fallback: usa mediana
-            ref_q = _safe_quantile(yv, 0.50)
-
-        kept: Dict[str, Optional[np.ndarray]] = {}
-        for name, arr in preds.items():
-            if arr is None:
-                kept[name] = None
-                continue
-            a = np.asarray(arr, float).reshape(-1)
-            qv = _safe_quantile(a, q_pred)
-            if not np.isfinite(qv):
-                kept[name] = None
-                continue
-
-            # Si el ref_q es muy pequeño, solo revisa que no sea absurdamente grande
-            if abs(ref_q) < 1e-9:
-                kept[name] = None if abs(qv) > 1e6 else a
-                continue
-
-            if abs(qv) > ratio * abs(ref_q):
-                kept[name] = None
-            else:
-                kept[name] = a
-        return kept
-
-    # =========================================================
     # (0) Preparación
     # =========================================================
     y = y.dropna().astype(float)
@@ -2224,7 +2227,8 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
     # (6) cierre de mes (LAST)
     out_png_close = os.path.join(out_c_dir, f"plot_monthly_CLOSE_LAST_{codigo}.png")
     out_csv_close = os.path.join(out_c_dir, f"future_monthly_CLOSE_LAST_{codigo}.csv")
-    plot_monthly_close_last(
+    # en vez de plot_monthly_close_last(...)
+    plot_monthly_close_last_from_daily_median(
         codigo=codigo,
         y=y,
         train_cut=train_cut,
@@ -2233,6 +2237,7 @@ def run_for_codigo_intraday(codigo: str, y: pd.Series, base_freq: str):
         out_csv=out_csv_close,
         use_col="pred_ENSEMBLE"
     )
+
     print(f"[OK] guardado cierre mensual (LAST): {out_png_close}")
 
     # =========================================================
@@ -2256,13 +2261,15 @@ def main():
 
     codigos = sorted(df_long["codigo"].unique().tolist())
     if ONLY_CODIGO is not None:
-        codigos = [str(ONLY_CODIGO)]
+        if isinstance(ONLY_CODIGO, (list, tuple, set, np.ndarray, pd.Series)):
+            codigos = [str(x) for x in ONLY_CODIGO]
+        else:
+            codigos = [str(ONLY_CODIGO)]
 
     print(f"[INFO] codigos a procesar: {len(codigos)}")
     print(f"[INFO] outputs: {OUT_DIR}")
     print(f"[INFO] input: {CSV_PATH}")
 
-    # acumuladores globales
     all_best_mean = []
     all_best_median = []
 
@@ -2271,8 +2278,10 @@ def main():
             g = df_long[df_long["codigo"] == str(c)].copy()
             if g.empty:
                 continue
+
             idx = pd.to_datetime(g["fecha"]).sort_values()
             base_freq = BASE_FREQ or infer_base_freq(pd.DatetimeIndex(idx))
+
             y = intraday_series(df_long, str(c), base_freq=base_freq)
             if y.empty:
                 print(f"[SKIP] {c}: serie intradía vacía")
@@ -2288,17 +2297,9 @@ def main():
             if best_model is None or df_fut is None or df_fut.empty:
                 continue
 
-            # si best_model == ENSEMBLE, asegúrate que exista esa columna:
-            if best_model == "ENSEMBLE":
-                # lo tratamos como "pred_ENSEMBLE"
-                # construimos un df temporal con "pred_ENSEMBLE" como si fuera modelo
-                df_tmp = df_fut.copy()
-                # exporta best mean/median usando la columna pred_ENSEMBLE
-                df_best_mean = monthly_wide_best_model_from_future(str(c), "ENSEMBLE", df_tmp.rename(columns={"pred_ENSEMBLE":"pred_ENSEMBLE"}), agg="mean")
-                df_best_median = monthly_wide_best_model_from_future(str(c), "ENSEMBLE", df_tmp.rename(columns={"pred_ENSEMBLE":"pred_ENSEMBLE"}), agg="median")
-            else:
-                df_best_mean = monthly_wide_best_model_from_future(str(c), best_model, df_fut, agg="mean")
-                df_best_median = monthly_wide_best_model_from_future(str(c), best_model, df_fut, agg="median")
+            # ✅ ya funciona incluso si best_model == "ENSEMBLE"
+            df_best_mean = monthly_wide_best_model_from_future(str(c), best_model, df_fut, agg="mean")
+            df_best_median = monthly_wide_best_model_from_future(str(c), best_model, df_fut, agg="median")
 
             if not df_best_mean.empty:
                 all_best_mean.append(df_best_mean)
@@ -2309,9 +2310,6 @@ def main():
             print(f"[ERROR] {c}: {e}")
             continue
 
-    # =========================================================
-    # GUARDAR CSV GLOBAL (todos los códigos) usando mejor modelo
-    # =========================================================
     if all_best_mean:
         df_all_mean = pd.concat(all_best_mean, ignore_index=True)
         out_all_mean = os.path.join(OUT_DIR, "ALL_best_model_monthly_MEAN_wide.csv")
@@ -2327,6 +2325,7 @@ def main():
         print(f"[OK] guardado GLOBAL best-model MEDIAN: {out_all_median}")
     else:
         print("[WARN] No se generó GLOBAL best-model MEDIAN (sin resultados)")
+
 
 
 if __name__ == "__main__":
