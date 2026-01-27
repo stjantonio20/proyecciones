@@ -10,7 +10,10 @@ from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # backend sin GUI (evita Tkinter)
 import matplotlib.pyplot as plt
+
 
 # ====== determinismo / CPU ======
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -28,13 +31,13 @@ warnings.filterwarnings("ignore")
 # =========================================================
 # ======= EXPORT GLOBAL (ancho) =======
 EXPORT_WIDE_FUTURE = True
-WIDE_PREFIX = "wide_future"  # nombre base de archivos
+WIDE_PREFIX = "proyeccion"  # nombre base de archivos
 # ====================================
 
-CSV_PATH = "Crediguate_formato_mensual.csv"
-OUT_DIR  = "outputs_modelos_extra"
+CSV_PATH = "./dataset/Crediguate_actualizado_mensual.csv"
+OUT_DIR  = "outputs_modelos_36meses"
 
-H_FUTURE = 12          # 1 año forecast
+H_FUTURE = 36          # 1 año forecast
 TEST_LEN = 6           # 6 meses test fijo
 
 #ONLY_CODIGO = "101101" # o None para todos
@@ -446,6 +449,93 @@ def rmse(y_true, y_pred) -> float:
     e = y_true[:m] - y_pred[:m]
     return float(np.sqrt(np.mean(e*e)))
 
+def save_future_preds_wide_excel(
+    out_xlsx: str,
+    results: List[dict],
+    month_cols: Optional[List[str]] = None,
+    sheet_name: str = "wide_future",
+):
+    """
+    Guarda un Excel con predicciones FUTURAS a lo ancho:
+
+        codigo | modelo | Dec-25 | Jan-26 | ... | Dec-26
+
+    Params
+    ------
+    out_xlsx : str
+        Ruta de salida .xlsx
+    results : List[dict]
+        Lista de resultados por código. Cada elemento DEBE tener:
+          - "codigo": str
+          - "future_idx": pd.DatetimeIndex  (o algo convertible)
+          - "preds_fut": Dict[str, np.ndarray]  (model_name -> array)
+        Esto lo puedes construir en tu main cuando llamas run_for_codigo().
+    month_cols : Optional[List[str]]
+        Si lo pasas, usa exactamente esas columnas (en ese orden).
+        Si None, se toma del primer result["future_idx"].
+    sheet_name : str
+        Nombre de la hoja en el Excel.
+    """
+    if not results:
+        raise ValueError("results está vacío. No hay nada que exportar.")
+
+    # Tomamos las columnas de meses del primer resultado si no vienen dadas
+    if month_cols is None:
+        fut0 = results[0].get("future_idx", None)
+        if fut0 is None:
+            raise ValueError("El primer elemento de results no tiene 'future_idx'.")
+        fut0 = pd.DatetimeIndex(fut0)
+        month_cols = [d.strftime("%b-%y") for d in fut0]
+
+    rows = []
+    for res in results:
+        codigo = str(res.get("codigo", ""))
+        fut_idx = res.get("future_idx", None)
+        preds_fut = res.get("preds_fut", {}) or {}
+
+        if fut_idx is None:
+            continue
+        fut_idx = pd.DatetimeIndex(fut_idx)
+
+        # etiquetas de meses por este código
+        local_month_cols = [d.strftime("%b-%y") for d in fut_idx]
+
+        for model_name, arr in preds_fut.items():
+            if arr is None:
+                continue
+            arr = np.asarray(arr, float).reshape(-1)
+            m = min(len(arr), len(local_month_cols))
+
+            row = {"codigo": codigo, "modelo": str(model_name)}
+            # llenar meses (según el índice futuro real de ese código)
+            for i in range(m):
+                row[local_month_cols[i]] = float(arr[i]) if np.isfinite(arr[i]) else np.nan
+
+            rows.append(row)
+
+    if not rows:
+        raise ValueError("No se generaron filas (quizá preds_fut está vacío o todo es None).")
+
+    df = pd.DataFrame(rows)
+
+    # Asegura todas las columnas y orden
+    fixed = ["codigo", "modelo"]
+    for c in month_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    df = df[fixed + month_cols]
+
+    # (Opcional) ordenar por codigo y modelo
+    df["codigo_ord"] = pd.to_numeric(df["codigo"], errors="coerce")
+    df = df.sort_values(["codigo_ord", "codigo", "modelo"]).drop(columns=["codigo_ord"])
+
+    # Guardar a Excel
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+    return df
+
 def plot_all_models(
     codigo: str,
     y: pd.Series,
@@ -850,7 +940,7 @@ def main():
     global_future_idx: Optional[pd.DatetimeIndex] = None
     global_month_cols: Optional[List[str]] = None
     # ========================================
-
+    all_results = []
     for c in codigos:
         try:
             s = series_by_codigo(long, str(c))
@@ -897,12 +987,22 @@ def main():
                     wide_best[codigo] = {}
                     for i in range(m):
                         wide_best[codigo][global_month_cols[i]] = float(best_arr[i])
-
+                # arma el dict con lo necesario
+            all_results.append({
+                "codigo": res["codigo"],
+                "future_idx": res["future_idx"],
+                "preds_fut": res["preds_fut"],
+            })
         except Exception as e:
             print(f"[ERROR] {c}: {e}")
             continue
 
     # ===== export final ancho =====
+    # al final:
+    out_xlsx = os.path.join(OUT_DIR, f"{WIDE_PREFIX}_ALL_MODELS.xlsx")
+    save_future_preds_wide_excel(out_xlsx, all_results)
+    print(f"[OK] guardado Excel wide: {out_xlsx}")
+    plt.close("all")
     if EXPORT_WIDE_FUTURE and global_future_idx is not None and global_month_cols is not None:
         ensure_dir(OUT_DIR)
 
@@ -939,7 +1039,7 @@ def main():
             out_path = os.path.join(OUT_DIR, f"{WIDE_PREFIX}_BEST_GLOBAL_MEDIAN.csv")
             export_wide_future_csv(out_path, wide_by_model[best_med_model], global_month_cols)
             print(f"[OK] guardado ancho: {out_path}  (BEST_GLOBAL_MEDIAN={best_med_model}, RMSE_median={best_med_score:,.4f})")
-
+    plt.close("all")
 
 if __name__ == "__main__":
     main()

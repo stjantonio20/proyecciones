@@ -1,6 +1,8 @@
 *.csv
 *.png
 *.odt
+*.txt
+*.zip
 !examples/*.csv
 !examples/*.png
 
