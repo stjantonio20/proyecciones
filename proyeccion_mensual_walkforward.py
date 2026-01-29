@@ -67,13 +67,14 @@ EXPORT_WIDE_FUTURE = True
 WIDE_PREFIX = "proyeccion"
 
 CSV_PATH = "./dataset/Crediguate_actualizado_mensual.csv"
-OUT_DIR  = "proyeccion_13meses_mensual_independiente_robusto_walkforward"
+OUT_DIR  = "proyeccion_13meses_mensual_walkforward"
 OUT_DIR_ONLY_FORECAST = os.path.join(OUT_DIR, "_solo_real_forecast")
 
 H_FUTURE = 37          # si tu último dato es Nov-25 => futuro: Dec-25..Dec-28 (37 meses)
 TEST_LEN = 6           # backtest: últimos 6 meses
 
 ONLY_CODIGO = None     # "601101" o None
+#ONLY_CODIGO = "601101"     # "601101" o None
 
 # crecimiento (YoY) lags cortos
 GROWTH_LAGS = 2
