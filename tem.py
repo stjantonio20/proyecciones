@@ -58,14 +58,14 @@ EXPORT_WIDE_FUTURE = True
 WIDE_PREFIX = "proyeccion"
 
 CSV_PATH = "./dataset/Crediguate_actualizado_mensual.csv"
-OUT_DIR  = "proyeccion_13meses_mensual_independiente_robusto"
+OUT_DIR  = "proyeccion_13meses_mensual_independiente_robusto2"
 OUT_DIR_ONLY_FORECAST = os.path.join(OUT_DIR, "_solo_real_forecast")
 
 H_FUTURE = 37          # si tu último dato es Nov-25 => futuro: Dec-25..Dec-26
 TEST_LEN = 6           # backtest: últimos 6 meses
 
 #ONLY_CODIGO = None     # "709110" o None
-ONLY_CODIGO = "601101"     # "709110" o None
+ONLY_CODIGO = "601104"     # "709110" o None
 
 # "lags" en años para crecimiento (muy pequeño por robustez)
 GROWTH_LAGS = 2
@@ -829,6 +829,8 @@ def predict_one_month_target(
     y_month_year: pd.Series,
     target_year: int,
     model_name: str,
+    month,
+    cache_pred,
 ) -> float:
     """
     Predice el nivel para (mes, target_year) usando SOLO ese mes a través de años.
@@ -842,6 +844,10 @@ def predict_one_month_target(
     y_month_year = y_month_year.dropna().astype(float).sort_index()
     if len(y_month_year) == 0:
         return float("nan")
+
+    key = (str(model_name), int(month), int(target_year))
+    if key in cache_pred:
+        return cache_pred[key]
 
     y_last = float("nan")
     if (target_year - 1) in y_month_year.index:
@@ -902,19 +908,25 @@ def predict_one_month_target(
     if not np.isfinite(g_pred):
         g_pred = growth_median_k(y_month_year, target_year, k=5)
 
-    return float(blend_level_and_growth(float(y_level_pred), float(g_pred), float(y_last)))
+    yhat_final = float(blend_level_and_growth(float(y_level_pred), float(g_pred), float(y_last)))
+    if np.isfinite(yhat_final):
+        cache_pred[key] = yhat_final
+    return yhat_final
+
+    #return float(blend_level_and_growth(float(y_level_pred), float(g_pred), float(y_last)))
 
 def backtest_monthly_independent(
     s: pd.Series,
     test_idx: pd.DatetimeIndex,
     model_name: str,
+    cache_pred,
 ) -> np.ndarray:
     preds = []
     for dt in test_idx:
         m = int(dt.month)
         y_my = extract_month_year_series(s, month=m)
         target_year = int(dt.year)
-        yhat = predict_one_month_target(y_my, target_year=target_year, model_name=model_name)
+        yhat = predict_one_month_target(y_my, target_year=target_year, model_name=model_name, month=m, cache_pred=cache_pred)
         preds.append(yhat)
     return np.array(preds, float)
 
@@ -922,13 +934,14 @@ def forecast_monthly_independent(
     s: pd.Series,
     future_idx: pd.DatetimeIndex,
     model_name: str,
+    cache_pred,
 ) -> np.ndarray:
     preds = []
     for dt in future_idx:
         m = int(dt.month)
         y_my = extract_month_year_series(s, month=m)
         target_year = int(dt.year)
-        yhat = predict_one_month_target(y_my, target_year=target_year, model_name=model_name)
+        yhat = predict_one_month_target(y_my, target_year=target_year, model_name=model_name, month=m, cache_pred=cache_pred)
         preds.append(yhat)
     return np.array(preds, float)
 
@@ -977,6 +990,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
             preds_fut[name]  = np.zeros(len(future_idx), float)
             scores[name]     = 0.0
     else:
+        cache_pred = {}  # key -> yhat
         for name in model_list:
             try:
                 # backtest: cada mes del test se predice por su mes-del-año
@@ -984,6 +998,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
                     s=pd.concat([y_train_full, y_test]),
                     test_idx=test_idx,
                     model_name=name,
+                    cache_pred=cache_pred,
                 )
                 preds_test[name] = yhat_test
                 scores[name] = rmse(y_test.values, yhat_test)
@@ -993,6 +1008,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
                     s=s,
                     future_idx=future_idx,
                     model_name=name,
+                    cache_pred=cache_pred,
                 )
                 preds_fut[name] = yhat_fut
             except Exception as e:

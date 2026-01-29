@@ -1,39 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-prediccion_mensual_independiente_robusto.py
+prediccion_mensual_independiente_robusto_cache_gc.py
 
-Basado en tu primer script (misma estructura de outputs) pero con lógica ROBUSTA
-inspirada en tu último script:
+Versión con CACHE (para acelerar) + liberación agresiva de RAM al terminar cada código/cuenta.
 
-- Sigue siendo "mensual-independiente": cada mes del año se aprende SOLO con historial
-  de ese mismo mes en distintos años (eje tiempo = años).
-- Mantiene TODOS los modelos (ETS, SARIMAX, Linear, Ridge, MLP, HGB, TCN, LSTM, DL_MultiTask).
-- Añade "rollback" (fallback) para que NUNCA se quede sin predicción:
-    - Nivel fallback: ETS (si se puede) -> Mean3 -> NaiveLast
-    - Crecimiento YoY fallback: mediana de últimos K crecimientos
-  y SIEMPRE mezcla nivel+crecimiento (blend) cuando sea posible.
-- Para modelos tabulares (Linear/Ridge/MLP/HGB) usa features tipo tu último script
-  (year, lag1, lag2, mean3, std3) y pesos exponenciales por recencia.
-- Guarda TODO como en el primer script:
-    - por código: plot_all, plot_forecast_only, csv por-código
-    - export wide por modelo y BEST, BEST_GLOBAL_MEAN/MEDIAN
-    - Excel proyeccion_ALL_MODELS.xlsx con (codigo, modelo, meses futuros...)
-- Además crea otra carpeta con SOLO las imágenes Real+Forecast:
-    OUT_DIR/_solo_real_forecast/<codigo>.png
+Qué cambia vs tu script robusto "sin cache" (el que sí te daba resultados):
+- Añade un cache LRU POR-CÓDIGO para reutilizar predicciones repetidas:
+    key = (model_name, month, target_year)
+  Se usa tanto en backtest como en forecast futuro.
+- Al finalizar cada código:
+    - limpia el cache
+    - borra objetos grandes
+    - cierra figuras
+    - gc.collect()
+    - si existe TensorFlow: tf.keras.backend.clear_session()
 
-Dataset:
-- CSV con columnas: codigo, Mar-15, Apr-15, ..., Nov-25 (o hasta donde llegue)
-  (igual que tu primer script).
+Esto ayuda cuando tienes muchos códigos (p.ej. 103) y modelos NN que tienden a “acumular” memoria.
+
+Requisitos:
+  pip install pandas numpy openpyxl scikit-learn statsmodels matplotlib
+  (opcional para NN) pip install tensorflow keras-tcn
 """
 
 import os
 import re
-import math
 import warnings
 import shutil
+import gc
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional, List
+from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
@@ -58,42 +55,42 @@ EXPORT_WIDE_FUTURE = True
 WIDE_PREFIX = "proyeccion"
 
 CSV_PATH = "./dataset/Crediguate_actualizado_mensual.csv"
-OUT_DIR  = "proyeccion_13meses_mensual_independiente_robusto"
+OUT_DIR  = "proyeccion_13meses_mensual_independiente_robusto_cache_gc"
 OUT_DIR_ONLY_FORECAST = os.path.join(OUT_DIR, "_solo_real_forecast")
 
-H_FUTURE = 37          # si tu último dato es Nov-25 => futuro: Dec-25..Dec-26
-TEST_LEN = 6           # backtest: últimos 6 meses
+H_FUTURE = 37
+TEST_LEN = 6
 
-#ONLY_CODIGO = None     # "709110" o None
-ONLY_CODIGO = "601101"     # "709110" o None
+#ONLY_CODIGO = None  # "601101" o None
+ONLY_CODIGO = "601101" #None
 
-# "lags" en años para crecimiento (muy pequeño por robustez)
+# crecimiento (YoY mismo mes)
 GROWTH_LAGS = 2
+GROWTH_BLEND_W = 0.35
+EPS_DEN = 1e-9
 
-# Pesos exponenciales por recencia (como tu último script)
+# pesos por recencia
 RECENT_YEARS = 10
 HALF_LIFE_YEARS = 4.0
 
-# switches (se mantienen)
+# switches
 RUN_ETS          = True
+RUN_SARIMAX      = True
+RUN_LINEAR       = True
+RUN_RIDGE        = True
+RUN_MLP          = True
+RUN_HGB          = True
 RUN_TCN          = True
 RUN_LSTM         = True
 RUN_MULTITASK_DL = True
 
-RUN_LINEAR       = True
-RUN_RIDGE        = True
-RUN_MLP          = True
-RUN_SARIMAX      = True
-RUN_HGB          = True
-
-# NN params (si hay pocos datos por mes, igual hará rollback)
+# NN params
 NN_EPOCHS   = 250
 NN_BATCH    = 16
 NN_PATIENCE = 12
 
-# mezcla nivel + crecimiento (YoY mismo mes)
-GROWTH_BLEND_W = 0.35
-EPS_DEN = 1e-9
+# CACHE (por-código)
+CACHE_MAX_ITEMS = 4000
 
 # =========================================================
 # Utils: parse columnas tipo "Mar-15"
@@ -102,32 +99,22 @@ MONTH_MAP = {
     # English
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-    # Spanish (common in LATAM datasets)
+    # Spanish
     "Ene": 1, "Feb": 2, "Mar": 3, "Abr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Ago": 8, "Sep": 9, "Set": 9, "Oct": 10, "Nov": 11, "Dic": 12
 }
 
 def parse_month_col(col: str) -> pd.Timestamp:
-    """
-    Acepta columnas tipo:
-      - Mar-15, mar-15, MAR-15
-      - Mar-2015 (también)
-      - Ene-15 / Abr-15 / Dic-25 (abrevs ES)
-    """
     col = str(col).strip()
     parts = col.split("-")
     if len(parts) != 2:
         raise ValueError(f"Columna de mes inválida: {col!r}")
     mon, yy = parts[0].strip(), parts[1].strip()
-    mon = mon[:3].title()  # Mar, Ene, Dic...
-    if len(yy) == 2:
-        year = 2000 + int(yy)
-    else:
-        year = int(yy)
+    mon = mon[:3].title()
+    year = (2000 + int(yy)) if len(yy) == 2 else int(yy)
     if mon not in MONTH_MAP:
         raise ValueError(f"Mes inválido en columna {col!r} (mon={mon!r})")
-    month = MONTH_MAP[mon]
-    return pd.Timestamp(year=year, month=month, day=1)
+    return pd.Timestamp(year=year, month=MONTH_MAP[mon], day=1)
 
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
@@ -212,10 +199,6 @@ def save_future_preds_wide_excel(
 # Growth + blend
 # =========================================================
 def growth_yoy(y_year: pd.Series) -> pd.Series:
-    """
-    y_year: index=year(int), values=nivel del mes (solo ese mes, por años)
-    g_t = (y_t - y_{t-1})/|y_{t-1}|
-    """
     y = y_year.copy().astype(float)
     yrs = y.index.values
     g = pd.Series(index=y.index, dtype=float)
@@ -251,11 +234,11 @@ def blend_level_and_growth(y_level_pred: float, g_pred: float, y_last: float) ->
     return float("nan")
 
 # =========================================================
-# Lógica tipo "último script": features por año + pesos recencia
+# Features eje año + pesos recencia
 # =========================================================
-def exp_weights_for_years(years: np.ndarray, last_obs_year: int, half_life: float = 4.0, boost_recent_years: int = 10) -> np.ndarray:
+def exp_weights_for_years(years: np.ndarray, last_obs_year: int, half_life: float, boost_recent_years: int) -> np.ndarray:
     years = np.asarray(years, dtype="int64")
-    k = np.log(2.0) / max(half_life, 1e-9)
+    k = np.log(2.0) / max(float(half_life), 1e-9)
     w = np.exp(k * (years - int(last_obs_year)))
     if boost_recent_years and boost_recent_years > 0:
         cutoff = int(last_obs_year) - (boost_recent_years - 1)
@@ -264,11 +247,6 @@ def exp_weights_for_years(years: np.ndarray, last_obs_year: int, half_life: floa
     return w.astype(float)
 
 def build_features_year_axis(years: np.ndarray, vals: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Features como tu último script (eje año):
-    X = [year, lag1, lag2, mean3, std3]
-    y = nivel actual
-    """
     years = np.asarray(years, dtype="int64")
     vals = np.asarray(vals, dtype="float64")
     order = np.argsort(years)
@@ -285,7 +263,6 @@ def build_features_year_axis(years: np.ndarray, vals: np.ndarray) -> Tuple[np.nd
         rows.append([float(years[i]), float(lag1), float(lag2), float(rm3), float(rs3), float(vals[i])])
 
     arr = np.asarray(rows, float)
-    # quitar filas con NaN en features/target
     mask = np.all(np.isfinite(arr), axis=1)
     arr = arr[mask]
     if arr.size == 0:
@@ -334,8 +311,7 @@ def fit_predict_ets_year(y_train: pd.Series, steps: int = 1) -> float:
         seasonal=None,
         initialization_method="estimated",
     ).fit(optimized=True)
-    yhat = model.forecast(steps)[-1]
-    return float(yhat)
+    return float(model.forecast(steps)[-1])
 
 def fit_predict_sarimax_year(y_train: pd.Series, steps: int = 1) -> float:
     from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -348,8 +324,7 @@ def fit_predict_sarimax_year(y_train: pd.Series, steps: int = 1) -> float:
         enforce_stationarity=False,
         enforce_invertibility=False
     ).fit(disp=False)
-    yhat = mod.forecast(steps=steps)[-1]
-    return float(yhat)
+    return float(mod.forecast(steps=steps)[-1])
 
 # =========================================================
 # Tabulares (features eje año) + pesos: Linear/Ridge/MLP/HGB
@@ -384,15 +359,7 @@ def fit_tabular_regressor(model_kind: str):
         )
     raise ValueError("model_kind no soportado")
 
-def tabular_predict_level_features(
-    y_month_year: pd.Series,
-    target_year: int,
-    model_kind: str,
-) -> float:
-    """
-    Entrena con años < target_year y predice target_year usando features:
-      [year, lag1, lag2, mean3, std3]
-    """
+def tabular_predict_level_features(y_month_year: pd.Series, target_year: int, model_kind: str) -> float:
     y = y_month_year.dropna().astype(float).sort_index()
     y_tr = y[y.index.astype(int) < int(target_year)]
     if len(y_tr) < 5:
@@ -408,7 +375,6 @@ def tabular_predict_level_features(
     last_obs_year = int(np.max(yrs_f))
     w = exp_weights_for_years(yrs_f, last_obs_year, half_life=HALF_LIFE_YEARS, boost_recent_years=RECENT_YEARS)
 
-    # features para target_year (usa últimos valores reales)
     lag1 = vals[-1]
     lag2 = vals[-2] if len(vals) >= 2 else vals[-1]
     prev3 = vals[-min(3, len(vals)):]
@@ -418,27 +384,16 @@ def tabular_predict_level_features(
 
     model = fit_tabular_regressor(model_kind)
 
-    # sample_weight: solo si no es Pipeline con StandardScaler? Pipeline sí lo acepta si el último estimador lo acepta.
-    # LinearRegression y Ridge aceptan sample_weight en fit; MLP no. Para MLP lo omitimos.
     if model_kind in ("Linear", "Ridge"):
         model.fit(X, Y, m__sample_weight=w)
     elif model_kind == "HGB":
         model.fit(X, Y, sample_weight=w)
-    else:  # MLP
+    else:
         model.fit(X, Y)
 
-    yhat = float(model.predict(X1)[0])
-    return yhat
+    return float(model.predict(X1)[0])
 
-def tabular_predict_growth_lags(
-    g_year: pd.Series,
-    target_year: int,
-    lags: int,
-) -> float:
-    """
-    Crecimiento: Ridge con lags pequeños (robusto).
-    Si no hay datos, lanza.
-    """
+def tabular_predict_growth_lags(g_year: pd.Series, target_year: int, lags: int) -> float:
     g = g_year.dropna().astype(float).sort_index()
     g_tr = g[g.index.astype(int) < int(target_year)]
     min_pairs = 3
@@ -460,11 +415,10 @@ def tabular_predict_growth_lags(
     model.fit(X, Y)
     tail = vals[-lags:]
     ghat = float(model.predict(tail.reshape(1, -1))[0])
-    ghat = float(np.clip(ghat, -0.95, 2.0))
-    return ghat
+    return float(np.clip(ghat, -0.95, 2.0))
 
 # =========================================================
-# Keras (se mantienen) - asinh scaler
+# Keras (LSTM/TCN/MultiTask)
 # =========================================================
 @dataclass
 class AsinhScaler:
@@ -492,8 +446,7 @@ def transform_asinh(y: np.ndarray, sc: AsinhScaler) -> np.ndarray:
 def inverse_asinh(z_scaled: np.ndarray, sc: AsinhScaler) -> np.ndarray:
     z_scaled = np.asarray(z_scaled, float)
     z = z_scaled * sc.sigma + sc.mu
-    y = np.sinh(z) * sc.s
-    return y
+    return np.sinh(z) * sc.s
 
 def make_supervised_1d(y_scaled: np.ndarray, lookback: int) -> Tuple[np.ndarray, np.ndarray]:
     y_scaled = np.asarray(y_scaled, float).reshape(-1)
@@ -573,35 +526,22 @@ def build_multitask_dl(input_len: int):
     )
     return m
 
-def train_keras_model(model, Xtr, Ytr, Xva, Yva, multitask=False):
+def train_keras_model(model, Xtr, Ytr, Xva, Yva, multitask: bool = False):
     from tensorflow.keras.callbacks import EarlyStopping
     cb = [EarlyStopping(monitor="val_loss", patience=NN_PATIENCE, restore_best_weights=True)]
-
     if not multitask:
-        model.fit(
-            Xtr, Ytr,
-            validation_data=(Xva, Yva),
-            epochs=NN_EPOCHS,
-            batch_size=NN_BATCH,
-            shuffle=False,
-            verbose=0,
-            callbacks=cb,
-        )
+        model.fit(Xtr, Ytr, validation_data=(Xva, Yva),
+                  epochs=NN_EPOCHS, batch_size=NN_BATCH, shuffle=False,
+                  verbose=0, callbacks=cb)
     else:
         ytr_level = Ytr
         ytr_delta = (Ytr.reshape(-1) - Xtr[:, -1, 0]).reshape(-1, 1)
         yva_level = Yva
         yva_delta = (Yva.reshape(-1) - Xva[:, -1, 0]).reshape(-1, 1)
-
-        model.fit(
-            Xtr, {"y_level": ytr_level, "y_delta": ytr_delta},
-            validation_data=(Xva, {"y_level": yva_level, "y_delta": yva_delta}),
-            epochs=NN_EPOCHS,
-            batch_size=NN_BATCH,
-            shuffle=False,
-            verbose=0,
-            callbacks=cb,
-        )
+        model.fit(Xtr, {"y_level": ytr_level, "y_delta": ytr_delta},
+                  validation_data=(Xva, {"y_level": yva_level, "y_delta": yva_delta}),
+                  epochs=NN_EPOCHS, batch_size=NN_BATCH, shuffle=False,
+                  verbose=0, callbacks=cb)
 
 def predict_keras_one_step(model, X):
     yhat = model.predict(X, verbose=0)
@@ -612,7 +552,6 @@ def predict_keras_one_step(model, X):
 def nn_predict_year(y_train_year: pd.Series, target_year: int, lookback: int, kind: str) -> float:
     y_train_year = y_train_year.dropna().astype(float).sort_index()
     y_train = y_train_year[y_train_year.index.astype(int) < int(target_year)]
-    # mínimos bajos; si no alcanza, falla y caerá al rollback
     min_pairs = 5
     min_years = lookback + min_pairs
     if len(y_train) < min_years:
@@ -649,7 +588,7 @@ def nn_predict_year(y_train_year: pd.Series, target_year: int, lookback: int, ki
     return float(inverse_asinh(np.array([yhat_s]), sc)[0])
 
 # =========================================================
-# Métricas / plots / export por código (igual estructura)
+# Métricas / plots / export por código
 # =========================================================
 def rmse(y_true, y_pred) -> float:
     y_true = np.asarray(y_true, float).reshape(-1)
@@ -660,16 +599,10 @@ def rmse(y_true, y_pred) -> float:
     e = y_true[:m] - y_pred[:m]
     return float(np.sqrt(np.mean(e*e)))
 
-def plot_all_models(
-    codigo: str,
-    y: pd.Series,
-    train_end: pd.Timestamp,
-    test_idx: pd.DatetimeIndex,
-    future_idx: pd.DatetimeIndex,
-    preds_test: Dict[str, np.ndarray],
-    preds_future: Dict[str, np.ndarray],
-    out_png: str
-):
+def plot_all_models(codigo: str, y: pd.Series, train_end: pd.Timestamp,
+                    test_idx: pd.DatetimeIndex, future_idx: pd.DatetimeIndex,
+                    preds_test: Dict[str, np.ndarray], preds_future: Dict[str, np.ndarray],
+                    out_png: str):
     plt.figure(figsize=(13, 5))
     plt.plot(y.index, y.values, label="Real", linewidth=2)
     plt.axvline(train_end, linestyle="--", linewidth=1)
@@ -702,14 +635,9 @@ def plot_all_models(
     plt.savefig(out_png, dpi=150)
     plt.close()
 
-def plot_forecast_only(
-    codigo: str,
-    y: pd.Series,
-    train_end: pd.Timestamp,
-    future_idx: pd.DatetimeIndex,
-    preds_future: Dict[str, np.ndarray],
-    out_png: str
-):
+def plot_forecast_only(codigo: str, y: pd.Series, train_end: pd.Timestamp,
+                       future_idx: pd.DatetimeIndex, preds_future: Dict[str, np.ndarray],
+                       out_png: str):
     plt.figure(figsize=(13, 5))
     plt.plot(y.index, y.values, label="Real", linewidth=2)
 
@@ -729,8 +657,7 @@ def plot_forecast_only(
         plt.plot(future_idx[:m], p[:m], label=f"{name} (forecast)", linestyle="-")
         drew_any = True
 
-    # si no dibujó nada, deja aviso en la figura (pero igual se guarda)
-    if not drew_any:
+    if not drew_any and len(future_idx) > 0:
         plt.text(future_idx[0], np.nanmedian(y.values) if len(y) else 0.0,
                  "NO HAY PREDS (revisar datos/modelos)", fontsize=10)
 
@@ -743,26 +670,18 @@ def plot_forecast_only(
     plt.savefig(out_png, dpi=150)
     plt.close()
 
-def export_csv_codigo(
-    out_csv: str,
-    y: pd.Series,
-    test_idx: pd.DatetimeIndex,
-    future_idx: pd.DatetimeIndex,
-    preds_test: Dict[str, np.ndarray],
-    preds_future: Dict[str, np.ndarray]
-):
+def export_csv_codigo(out_csv: str, y: pd.Series,
+                      test_idx: pd.DatetimeIndex, future_idx: pd.DatetimeIndex,
+                      preds_test: Dict[str, np.ndarray], preds_future: Dict[str, np.ndarray]):
     df = pd.DataFrame({"fecha": y.index, "real": y.values}).set_index("fecha")
-
     for name, p in preds_test.items():
         if p is None:
             continue
         df[f"pred_test_{name}"] = pd.Series(p, index=test_idx[:len(p)])
-
     for name, p in preds_future.items():
         if p is None:
             continue
         df[f"pred_future_{name}"] = pd.Series(p, index=future_idx[:len(p)])
-
     df.reset_index().to_csv(out_csv, index=False)
 
 # =========================================================
@@ -775,7 +694,6 @@ def read_wide_monthly(path: str) -> pd.DataFrame:
         df = pd.read_csv(path, sep="|", engine="python")
 
     df.columns = [str(c).strip() for c in df.columns]
-
     for c in df.columns:
         if c.lower() == "codigo" and c != "codigo":
             df = df.rename(columns={c: "codigo"})
@@ -785,10 +703,9 @@ def read_wide_monthly(path: str) -> pd.DataFrame:
 
     df["codigo"] = df["codigo"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
 
-    # SOLO columnas tipo "Mar-15" (o "Mar-2015"). Ignora otras columnas extra.
     month_cols = [c for c in df.columns if c != "codigo" and re.match(r"^[A-Za-zÁÉÍÓÚáéíóú]{3}-\d{2,4}$", str(c).strip())]
     if not month_cols:
-        raise ValueError("No se detectaron columnas de mes tipo Mar-15/Mar-2015. Revisa el encabezado del CSV.")
+        raise ValueError("No se detectaron columnas de mes tipo Mar-15/Mar-2015.")
     col_to_ts = {}
     for c in month_cols:
         try:
@@ -797,7 +714,7 @@ def read_wide_monthly(path: str) -> pd.DataFrame:
             continue
     month_cols = [c for c in month_cols if c in col_to_ts]
     if not month_cols:
-        raise ValueError("Las columnas candidatas no pudieron parsearse a fechas (parse_month_col falló).")
+        raise ValueError("No se pudieron parsear columnas a fechas (parse_month_col falló).")
 
     long = df.melt(id_vars=["codigo"], value_vars=month_cols, var_name="mes", value_name="valor")
     long["fecha"] = long["mes"].map(col_to_ts)
@@ -814,7 +731,7 @@ def series_by_codigo(long: pd.DataFrame, codigo: str) -> pd.Series:
     return s.astype(float)
 
 # =========================================================
-# Predicción mensual-independiente: helpers
+# Predicción mensual-independiente + CACHE
 # =========================================================
 def extract_month_year_series(s: pd.Series, month: int) -> pd.Series:
     ss = s.dropna().astype(float)
@@ -825,19 +742,31 @@ def extract_month_year_series(s: pd.Series, month: int) -> pd.Series:
     y = y[~y.index.duplicated(keep="last")].sort_index()
     return y.astype(float)
 
-def predict_one_month_target(
-    y_month_year: pd.Series,
-    target_year: int,
-    model_name: str,
-) -> float:
+class LRUCache:
+    def __init__(self, max_items: int = 4000):
+        self.max_items = int(max_items)
+        self.d = OrderedDict()
+
+    def get(self, key):
+        if key in self.d:
+            self.d.move_to_end(key)
+            return self.d[key]
+        return None
+
+    def set(self, key, value):
+        self.d[key] = value
+        self.d.move_to_end(key)
+        if len(self.d) > self.max_items:
+            self.d.popitem(last=False)
+
+    def clear(self):
+        self.d.clear()
+
+def predict_one_month_target(y_month_year: pd.Series, target_year: int, model_name: str) -> float:
     """
     Predice el nivel para (mes, target_year) usando SOLO ese mes a través de años.
     Integra crecimiento YoY y hace blend.
-
-    Lógica robusta:
-    - Intenta el modelo solicitado.
-    - Si falla o no hay datos suficientes, rollback tipo: ETS -> Mean3 -> NaiveLast
-    - Crecimiento: intenta Ridge con lags pequeños; si falla -> mediana últimos YoY
+    Con rollback robusto (ETS -> Mean3 -> NaiveLast, crecimiento -> median).
     """
     y_month_year = y_month_year.dropna().astype(float).sort_index()
     if len(y_month_year) == 0:
@@ -848,11 +777,9 @@ def predict_one_month_target(
         y_last = float(y_month_year.loc[target_year - 1])
 
     g = growth_yoy(y_month_year)
-
     y_level_pred = float("nan")
     g_pred = float("nan")
 
-    # ===== intento normal =====
     try:
         y_train = y_month_year[y_month_year.index.astype(int) < int(target_year)]
         if len(y_train) < 3:
@@ -860,20 +787,15 @@ def predict_one_month_target(
 
         if model_name == "ETS":
             y_level_pred = fit_predict_ets_year(y_train, steps=1)
-
         elif model_name == "SARIMAX":
             y_level_pred = fit_predict_sarimax_year(y_train, steps=1)
-
         elif model_name in ("Linear", "Ridge", "MLP", "HGB"):
             y_level_pred = tabular_predict_level_features(y_month_year, target_year=target_year, model_kind=model_name)
-            # crecimiento: ridge con lags pequeños (si puede)
             try:
                 g_pred = tabular_predict_growth_lags(g, target_year=target_year, lags=GROWTH_LAGS)
             except Exception:
                 g_pred = growth_median_k(y_month_year, target_year, k=5)
-
         elif model_name in ("LSTM", "TCN", "DL_MultiTask"):
-            # lookback por años: usa ~5 si hay datos, si no falla y cae a rollback
             lookback = 5
             y_level_pred = nn_predict_year(y_month_year, target_year=target_year, lookback=lookback, kind=model_name)
             try:
@@ -884,7 +806,7 @@ def predict_one_month_target(
             raise ValueError("modelo no soportado")
 
     except Exception:
-        # ===== ROLLBACK robusto (como tu último script) =====
+        # rollback
         try:
             y_train = y_month_year[y_month_year.index.astype(int) < int(target_year)]
             if len(y_train) >= 5:
@@ -895,51 +817,56 @@ def predict_one_month_target(
             y_level_pred = level_mean_k(y_month_year, target_year, k=3)
             if not np.isfinite(y_level_pred):
                 y_level_pred = level_naive_last(y_month_year, target_year)
-
         g_pred = growth_median_k(y_month_year, target_year, k=5)
 
-    # si g_pred sigue NaN, intenta fallback
     if not np.isfinite(g_pred):
         g_pred = growth_median_k(y_month_year, target_year, k=5)
 
     return float(blend_level_and_growth(float(y_level_pred), float(g_pred), float(y_last)))
 
-def backtest_monthly_independent(
-    s: pd.Series,
-    test_idx: pd.DatetimeIndex,
-    model_name: str,
-) -> np.ndarray:
+def backtest_monthly_independent(s: pd.Series, test_idx: pd.DatetimeIndex, model_name: str, cache: Optional[LRUCache]) -> np.ndarray:
     preds = []
     for dt in test_idx:
         m = int(dt.month)
-        y_my = extract_month_year_series(s, month=m)
         target_year = int(dt.year)
+        key = (model_name, m, target_year)
+        if cache is not None:
+            hit = cache.get(key)
+            if hit is not None:
+                preds.append(hit)
+                continue
+        y_my = extract_month_year_series(s, month=m)
         yhat = predict_one_month_target(y_my, target_year=target_year, model_name=model_name)
+        if cache is not None:
+            cache.set(key, float(yhat))
         preds.append(yhat)
     return np.array(preds, float)
 
-def forecast_monthly_independent(
-    s: pd.Series,
-    future_idx: pd.DatetimeIndex,
-    model_name: str,
-) -> np.ndarray:
+def forecast_monthly_independent(s: pd.Series, future_idx: pd.DatetimeIndex, model_name: str, cache: Optional[LRUCache]) -> np.ndarray:
     preds = []
     for dt in future_idx:
         m = int(dt.month)
-        y_my = extract_month_year_series(s, month=m)
         target_year = int(dt.year)
+        key = (model_name, m, target_year)
+        if cache is not None:
+            hit = cache.get(key)
+            if hit is not None:
+                preds.append(hit)
+                continue
+        y_my = extract_month_year_series(s, month=m)
         yhat = predict_one_month_target(y_my, target_year=target_year, model_name=model_name)
+        if cache is not None:
+            cache.set(key, float(yhat))
         preds.append(yhat)
     return np.array(preds, float)
 
 # =========================================================
-# RUN por codigo (estructura igual)
+# RUN por codigo (misma estructura) + liberar RAM
 # =========================================================
 def run_for_codigo(codigo: str, s: pd.Series):
     s = s.dropna().astype(float)
     s = s.replace([np.inf, -np.inf], np.nan).dropna()
 
-    # mínimo razonable para poder tener test y algo de historia (no exagerado)
     min_len = max(36, TEST_LEN + 24)
     if len(s) < min_len:
         print(f"[SKIP] {codigo}: muy corta global (n={len(s)}), min_len={min_len}")
@@ -971,98 +898,84 @@ def run_for_codigo(codigo: str, s: pd.Series):
     if RUN_LSTM: model_list.append("LSTM")
     if RUN_MULTITASK_DL: model_list.append("DL_MultiTask")
 
-    if all_zero:
-        for name in model_list:
-            preds_test[name] = np.zeros(len(test_idx), float)
-            preds_fut[name]  = np.zeros(len(future_idx), float)
-            scores[name]     = 0.0
-    else:
-        for name in model_list:
-            try:
-                # backtest: cada mes del test se predice por su mes-del-año
-                yhat_test = backtest_monthly_independent(
-                    s=pd.concat([y_train_full, y_test]),
-                    test_idx=test_idx,
-                    model_name=name,
-                )
-                preds_test[name] = yhat_test
-                scores[name] = rmse(y_test.values, yhat_test)
+    cache_pred = LRUCache(max_items=CACHE_MAX_ITEMS)
 
-                # forecast futuro
-                yhat_fut = forecast_monthly_independent(
-                    s=s,
-                    future_idx=future_idx,
-                    model_name=name,
-                )
-                preds_fut[name] = yhat_fut
-            except Exception as e:
-                print(f"[WARN] {codigo} {name} falló: {e}")
-                preds_test[name] = None
-                preds_fut[name]  = None
-
-    # ===== imprimir ranking =====
-    scored = sorted(scores.items(), key=lambda kv: kv[1] if np.isfinite(kv[1]) else 1e99)
-    print(f"\n=== {codigo} (n={len(s)}, test={len(y_test)}) mensual-indep robusto ===")
-    for name, r in scored:
-        print(f"  {name:12s} RMSE_test = {r:,.4f}")
-
-    # ===== outputs por-código =====
-    out_c_dir = os.path.join(OUT_DIR, f"codigo_{codigo}")
-    ensure_dir(out_c_dir)
-
-    out_png_all = os.path.join(out_c_dir, f"plot_{codigo}.png")
-    out_png_fore = os.path.join(out_c_dir, f"plot_forecast_only_{codigo}.png")
-    out_csv = os.path.join(out_c_dir, f"pred_{codigo}.csv")
-
-    plot_all_models(
-        codigo=codigo,
-        y=s,
-        train_end=train_end_date,
-        test_idx=test_idx,
-        future_idx=future_idx,
-        preds_test=preds_test,
-        preds_future=preds_fut,
-        out_png=out_png_all
-    )
-
-    plot_forecast_only(
-        codigo=codigo,
-        y=s,
-        train_end=train_end_date,
-        future_idx=future_idx,
-        preds_future=preds_fut,
-        out_png=out_png_fore
-    )
-
-    # Copiar forecast-only a carpeta extra (sin romper el flujo)
     try:
-        ensure_dir(OUT_DIR_ONLY_FORECAST)
-        if os.path.exists(out_png_fore):
-            shutil.copy2(out_png_fore, os.path.join(OUT_DIR_ONLY_FORECAST, f"{codigo}.png"))
+        if all_zero:
+            for name in model_list:
+                preds_test[name] = np.zeros(len(test_idx), float)
+                preds_fut[name]  = np.zeros(len(future_idx), float)
+                scores[name]     = 0.0
         else:
-            print(f"[WARN] No existe {out_png_fore} (no se generó el png).")
-    except Exception as e:
-        print(f"[WARN] No se pudo copiar forecast-only de {codigo}: {e}")
+            s_full = pd.concat([y_train_full, y_test])  # evita Series.append (deprecated)
+            for name in model_list:
+                try:
+                    yhat_test = backtest_monthly_independent(s_full, test_idx, name, cache_pred)
+                    preds_test[name] = yhat_test
+                    scores[name] = rmse(y_test.values, yhat_test)
 
-    export_csv_codigo(
-        out_csv=out_csv,
-        y=s,
-        test_idx=test_idx,
-        future_idx=future_idx,
-        preds_test=preds_test,
-        preds_future=preds_fut
-    )
+                    yhat_fut = forecast_monthly_independent(s, future_idx, name, cache_pred)
+                    preds_fut[name] = yhat_fut
+                except Exception as e:
+                    print(f"[WARN] {codigo} {name} falló: {e}")
+                    preds_test[name] = None
+                    preds_fut[name]  = None
 
-    print(f"[OK] guardado: {out_png_all}")
-    print(f"[OK] guardado: {out_png_fore}")
-    print(f"[OK] guardado: {out_csv}")
+        scored = sorted(scores.items(), key=lambda kv: kv[1] if np.isfinite(kv[1]) else 1e99)
+        print(f"\n=== {codigo} (n={len(s)}, test={len(y_test)}) mensual-indep robusto (cache+gc) ===")
+        for name, r in scored:
+            print(f"  {name:12s} RMSE_test = {r:,.4f}")
 
-    return {
-        "codigo": codigo,
-        "future_idx": future_idx,
-        "preds_fut": preds_fut,
-        "scores": scores,
-    }
+        out_c_dir = os.path.join(OUT_DIR, f"codigo_{codigo}")
+        ensure_dir(out_c_dir)
+
+        out_png_all = os.path.join(out_c_dir, f"plot_{codigo}.png")
+        out_png_fore = os.path.join(out_c_dir, f"plot_forecast_only_{codigo}.png")
+        out_csv = os.path.join(out_c_dir, f"pred_{codigo}.csv")
+
+        plot_all_models(codigo, s, train_end_date, test_idx, future_idx, preds_test, preds_fut, out_png_all)
+        plot_forecast_only(codigo, s, train_end_date, future_idx, preds_fut, out_png_fore)
+
+        try:
+            ensure_dir(OUT_DIR_ONLY_FORECAST)
+            if os.path.exists(out_png_fore):
+                shutil.copy2(out_png_fore, os.path.join(OUT_DIR_ONLY_FORECAST, f"{codigo}.png"))
+        except Exception as e:
+            print(f"[WARN] No se pudo copiar forecast-only de {codigo}: {e}")
+
+        export_csv_codigo(out_csv, s, test_idx, future_idx, preds_test, preds_fut)
+
+        print(f"[OK] guardado: {out_png_all}")
+        print(f"[OK] guardado: {out_png_fore}")
+        print(f"[OK] guardado: {out_csv}")
+
+        return {"codigo": codigo, "future_idx": future_idx, "preds_fut": preds_fut, "scores": scores}
+
+    finally:
+        # ===========================
+        # LIBERAR RAM por código
+        # ===========================
+        try:
+            cache_pred.clear()
+        except Exception:
+            pass
+
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
+        # TensorFlow tiende a acumular: limpia sesión si está instalado
+        try:
+            import tensorflow as tf  # noqa: F401
+            try:
+                tf.keras.backend.clear_session()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        gc.collect()
 
 # =========================================================
 # MAIN
@@ -1072,7 +985,6 @@ def main():
     ensure_dir(OUT_DIR_ONLY_FORECAST)
 
     long = read_wide_monthly(CSV_PATH)
-
     codigos = sorted(long["codigo"].unique().tolist())
     if ONLY_CODIGO is not None:
         codigos = [str(ONLY_CODIGO)]
@@ -1087,6 +999,7 @@ def main():
     global_month_cols: Optional[List[str]] = None
 
     all_results = []
+
     for c in codigos:
         try:
             s = series_by_codigo(long, str(c))
@@ -1095,6 +1008,11 @@ def main():
                 continue
 
             res = run_for_codigo(str(c), s)
+
+            # libera series lo antes posible
+            del s
+            gc.collect()
+
             if res is None:
                 continue
 
@@ -1134,30 +1052,31 @@ def main():
                     for i in range(m):
                         wide_best[codigo][global_month_cols[i]] = float(best_arr[i])
 
-            all_results.append({
-                "codigo": res["codigo"],
-                "future_idx": res["future_idx"],
-                "preds_fut": res["preds_fut"],
-            })
+            all_results.append({"codigo": codigo, "future_idx": future_idx, "preds_fut": preds_fut})
+
+            # liberar res pronto
+            del res, preds_fut, scores, future_idx
+            gc.collect()
 
         except Exception as e:
             print(f"[ERROR] {c}: {e}")
+            gc.collect()
             continue
 
-    # ===== Excel wide (codigo,modelo,meses...) =====
+    # Excel wide (codigo,modelo,meses...)
     if all_results:
         out_xlsx = os.path.join(OUT_DIR, f"{WIDE_PREFIX}_ALL_MODELS.xlsx")
         try:
             save_future_preds_wide_excel(out_xlsx, all_results)
             print(f"[OK] guardado Excel wide: {out_xlsx}")
         except Exception as e:
-            print(f"[WARN] No se pudo guardar Excel wide (quizá no hubo preds válidas): {e}")
+            print(f"[WARN] No se pudo guardar Excel wide: {e}")
     else:
         print("[WARN] all_results vacío: no hubo ningún código procesado exitosamente.")
 
     plt.close("all")
 
-    # ===== CSVs wide por modelo + BEST + BEST_GLOBAL =====
+    # CSVs wide por modelo + BEST + BEST_GLOBAL
     if EXPORT_WIDE_FUTURE and global_future_idx is not None and global_month_cols is not None:
         ensure_dir(OUT_DIR)
 
@@ -1196,6 +1115,7 @@ def main():
             print(f"[OK] guardado ancho: {out_path}  (BEST_GLOBAL_MEDIAN={best_med_model}, RMSE_median={best_med_score:,.4f})")
 
     plt.close("all")
+    gc.collect()
 
 if __name__ == "__main__":
     main()
