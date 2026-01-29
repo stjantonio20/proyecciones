@@ -10,7 +10,10 @@ from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # backend sin GUI (evita Tkinter)
 import matplotlib.pyplot as plt
+
 
 # ====== determinismo / CPU ======
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -28,16 +31,16 @@ warnings.filterwarnings("ignore")
 # =========================================================
 # ======= EXPORT GLOBAL (ancho) =======
 EXPORT_WIDE_FUTURE = True
-WIDE_PREFIX = "wide_future"  # nombre base de archivos
+WIDE_PREFIX = "proyeccion"  # nombre base de archivos
 # ====================================
 
-CSV_PATH = "Crediguate_formato_mensual.csv"
-OUT_DIR  = "outputs_modelos_extra"
+CSV_PATH = "./dataset/Crediguate_actualizado_mensual.csv"
+OUT_DIR  = "proyeccion_13meses"
 
-H_FUTURE = 12          # 1 año forecast
+H_FUTURE = 13          # 1 año forecast  ESPECIFICA EN MESES LOS QUE QUIERES PREDECIR
 TEST_LEN = 6           # 6 meses test fijo
 
-#ONLY_CODIGO = "101101" # o None para todos
+#ONLY_CODIGO = "709110" # o None para todos
 ONLY_CODIGO = None # o None para todos
 
 LOOKBACK_NN  = 16      # para LSTM/TCN
@@ -446,6 +449,93 @@ def rmse(y_true, y_pred) -> float:
     e = y_true[:m] - y_pred[:m]
     return float(np.sqrt(np.mean(e*e)))
 
+def save_future_preds_wide_excel(
+    out_xlsx: str,
+    results: List[dict],
+    month_cols: Optional[List[str]] = None,
+    sheet_name: str = "wide_future",
+):
+    """
+    Guarda un Excel con predicciones FUTURAS a lo ancho:
+
+        codigo | modelo | Dec-25 | Jan-26 | ... | Dec-26
+
+    Params
+    ------
+    out_xlsx : str
+        Ruta de salida .xlsx
+    results : List[dict]
+        Lista de resultados por código. Cada elemento DEBE tener:
+          - "codigo": str
+          - "future_idx": pd.DatetimeIndex  (o algo convertible)
+          - "preds_fut": Dict[str, np.ndarray]  (model_name -> array)
+        Esto lo puedes construir en tu main cuando llamas run_for_codigo().
+    month_cols : Optional[List[str]]
+        Si lo pasas, usa exactamente esas columnas (en ese orden).
+        Si None, se toma del primer result["future_idx"].
+    sheet_name : str
+        Nombre de la hoja en el Excel.
+    """
+    if not results:
+        raise ValueError("results está vacío. No hay nada que exportar.")
+
+    # Tomamos las columnas de meses del primer resultado si no vienen dadas
+    if month_cols is None:
+        fut0 = results[0].get("future_idx", None)
+        if fut0 is None:
+            raise ValueError("El primer elemento de results no tiene 'future_idx'.")
+        fut0 = pd.DatetimeIndex(fut0)
+        month_cols = [d.strftime("%b-%y") for d in fut0]
+
+    rows = []
+    for res in results:
+        codigo = str(res.get("codigo", ""))
+        fut_idx = res.get("future_idx", None)
+        preds_fut = res.get("preds_fut", {}) or {}
+
+        if fut_idx is None:
+            continue
+        fut_idx = pd.DatetimeIndex(fut_idx)
+
+        # etiquetas de meses por este código
+        local_month_cols = [d.strftime("%b-%y") for d in fut_idx]
+
+        for model_name, arr in preds_fut.items():
+            if arr is None:
+                continue
+            arr = np.asarray(arr, float).reshape(-1)
+            m = min(len(arr), len(local_month_cols))
+
+            row = {"codigo": codigo, "modelo": str(model_name)}
+            # llenar meses (según el índice futuro real de ese código)
+            for i in range(m):
+                row[local_month_cols[i]] = float(arr[i]) if np.isfinite(arr[i]) else np.nan
+
+            rows.append(row)
+
+    if not rows:
+        raise ValueError("No se generaron filas (quizá preds_fut está vacío o todo es None).")
+
+    df = pd.DataFrame(rows)
+
+    # Asegura todas las columnas y orden
+    fixed = ["codigo", "modelo"]
+    for c in month_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    df = df[fixed + month_cols]
+
+    # (Opcional) ordenar por codigo y modelo
+    df["codigo_ord"] = pd.to_numeric(df["codigo"], errors="coerce")
+    df = df.sort_values(["codigo_ord", "codigo", "modelo"]).drop(columns=["codigo_ord"])
+
+    # Guardar a Excel
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+    return df
+
 def plot_all_models(
     codigo: str,
     y: pd.Series,
@@ -482,6 +572,159 @@ def plot_all_models(
     plt.savefig(out_png, dpi=150)
     plt.close()
 
+def _robust_scale_from_real(y: pd.Series):
+    """Devuelve límites/escala robusta basada en la serie real."""
+    yy = np.asarray(y.values, float)
+    yy = yy[np.isfinite(yy)]
+    if len(yy) == 0:
+        return dict(p5=0.0, p95=1.0, iqr=1.0, span=1.0, hard_cap=1.0)
+
+    p5  = float(np.nanpercentile(yy, 5))
+    p95 = float(np.nanpercentile(yy, 95))
+    q1  = float(np.nanpercentile(yy, 25))
+    q3  = float(np.nanpercentile(yy, 75))
+    iqr = max(q3 - q1, 1e-9)
+
+    # span robusto (por si p95≈p5)
+    span = max(p95 - p5, iqr, 1e-9)
+
+    # hard cap: máximo "razonable" absoluto, por si hay series cerca de 0
+    # (p95 + 10*span) permite crecimiento, pero evita explosiones tipo 1e9.
+    hard_cap = max(abs(p95), abs(p5), 1.0) + 10.0 * span
+
+    return dict(p5=p5, p95=p95, iqr=iqr, span=span, hard_cap=hard_cap)
+
+def _should_drop_forecast(
+    p: np.ndarray,
+    scale: dict,
+    ratio_p95: float = 6.0,
+    ratio_max: float = 10.0
+):
+    """
+    Decide si descartar un forecast por ser 'extremo' vs. la serie real.
+    - ratio_p95: umbral para p95_forecast vs. hard_cap_real
+    - ratio_max: umbral para max_abs_forecast vs. hard_cap_real
+    """
+    pp = np.asarray(p, float).ravel()
+    pp = pp[np.isfinite(pp)]
+    if len(pp) == 0:
+        return True, "vacío/NaN"
+
+    p95_f = float(np.nanpercentile(pp, 95))
+    max_abs = float(np.nanmax(np.abs(pp)))
+
+    hard_cap = scale["hard_cap"]
+
+    # Si el forecast explota en percentil 95 o en máximo absoluto, lo descartamos
+    if p95_f > ratio_p95 * hard_cap:
+        return True, f"p95_forecast={p95_f:.3g} >> cap={hard_cap:.3g}"
+    if max_abs > ratio_max * hard_cap:
+        return True, f"max|forecast|={max_abs:.3g} >> cap={hard_cap:.3g}"
+
+    return False, ""
+
+def _robust_real_stats(y: pd.Series):
+    yy = np.asarray(y.values, float)
+    yy = yy[np.isfinite(yy)]
+    if len(yy) == 0:
+        return dict(p50=0.0, p95=1.0, p99=1.0)
+    return dict(
+        p50=float(np.nanpercentile(yy, 50)),
+        p95=float(np.nanpercentile(yy, 95)),
+        p99=float(np.nanpercentile(yy, 99)),
+    )
+
+def _should_drop_forecast_v2(p: np.ndarray, real_stats: dict,
+                            factor_p95: float = 2.5,
+                            factor_max: float = 3.0):
+    """
+    Descarta si el forecast está demasiado arriba de la escala real:
+      - p95_forecast > factor_p95 * p95_real
+      - max_forecast > factor_max * p99_real
+    """
+    pp = np.asarray(p, float).ravel()
+    pp = pp[np.isfinite(pp)]
+    if len(pp) == 0:
+        return True, "vacío/NaN"
+
+    p95_f = float(np.nanpercentile(pp, 95))
+    max_f = float(np.nanmax(pp))
+
+    p95_r = max(real_stats["p95"], 1e-9)
+    p99_r = max(real_stats["p99"], 1e-9)
+
+    if p95_f > factor_p95 * p95_r:
+        return True, f"p95_forecast={p95_f:.3g} > {factor_p95}*p95_real={p95_r:.3g}"
+    if max_f > factor_max * p99_r:
+        return True, f"max_forecast={max_f:.3g} > {factor_max}*p99_real={p99_r:.3g}"
+
+    return False, ""
+
+'''
+def plot_forecast_only(
+    codigo: str,
+    y: pd.Series,
+    train_end: pd.Timestamp,
+    future_idx: pd.DatetimeIndex,
+    preds_future: Dict[str, np.ndarray],
+    out_png: str,
+    drop_extremes: bool = True,
+    ratio_p95: float = 6.0,
+    ratio_max: float = 10.0,
+    verbose_drop: bool = True
+):
+    """
+    Gráfica SOLO forecast (sin test):
+      - muestra TODA la serie real completa + forecast de todos los modelos
+      - NO dibuja líneas de pred_test
+      - si un modelo genera valores extremos, NO se grafica (opcional)
+    """
+    plt.figure(figsize=(13, 5))
+
+    # serie completa real
+    plt.plot(y.index, y.values, label="Real", linewidth=2)
+
+    # escala robusta de la serie real
+    scale = _robust_scale_from_real(y)
+
+    # línea de corte train_end (referencia visual)
+    if train_end is not None:
+        plt.axvline(train_end, linestyle="--", linewidth=1)
+        y_min = float(np.nanmin(y.values[np.isfinite(y.values)])) if np.isfinite(np.nanmin(y.values)) else 0.0
+        plt.text(train_end, y_min, "  train_end", rotation=90, va="bottom")
+
+    # solo forecasts (filtrados)
+    real_stats = _robust_real_stats(y)
+
+    for name, p in preds_future.items():
+        if p is None:
+            continue
+        p = np.asarray(p, float).reshape(-1)
+        m = min(len(future_idx), len(p))
+        p_plot = p[:m]
+
+        drop, reason = _should_drop_forecast_v2(
+            p_plot, real_stats,
+            factor_p95=1.7,   # baja/sube
+            factor_max=1.0
+        )
+        if drop:
+            print(f"[DROP] {codigo} | {name}: {reason}")
+            continue
+
+        plt.plot(future_idx[:m], p_plot, label=f"{name} (forecast)", linestyle="-")
+
+
+    plt.title(f"Codigo {codigo} — Forecast {len(future_idx)}m (sin test)")
+    plt.xlabel("Fecha")
+    plt.ylabel("Valor")
+    plt.grid(True, alpha=0.3)
+    plt.legend(ncol=2, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+'''
 def plot_forecast_only(
     codigo: str,
     y: pd.Series,
@@ -850,7 +1093,7 @@ def main():
     global_future_idx: Optional[pd.DatetimeIndex] = None
     global_month_cols: Optional[List[str]] = None
     # ========================================
-
+    all_results = []
     for c in codigos:
         try:
             s = series_by_codigo(long, str(c))
@@ -897,12 +1140,22 @@ def main():
                     wide_best[codigo] = {}
                     for i in range(m):
                         wide_best[codigo][global_month_cols[i]] = float(best_arr[i])
-
+                # arma el dict con lo necesario
+            all_results.append({
+                "codigo": res["codigo"],
+                "future_idx": res["future_idx"],
+                "preds_fut": res["preds_fut"],
+            })
         except Exception as e:
             print(f"[ERROR] {c}: {e}")
             continue
 
     # ===== export final ancho =====
+    # al final:
+    out_xlsx = os.path.join(OUT_DIR, f"{WIDE_PREFIX}_ALL_MODELS.xlsx")
+    save_future_preds_wide_excel(out_xlsx, all_results)
+    print(f"[OK] guardado Excel wide: {out_xlsx}")
+    plt.close("all")
     if EXPORT_WIDE_FUTURE and global_future_idx is not None and global_month_cols is not None:
         ensure_dir(OUT_DIR)
 
@@ -939,7 +1192,7 @@ def main():
             out_path = os.path.join(OUT_DIR, f"{WIDE_PREFIX}_BEST_GLOBAL_MEDIAN.csv")
             export_wide_future_csv(out_path, wide_by_model[best_med_model], global_month_cols)
             print(f"[OK] guardado ancho: {out_path}  (BEST_GLOBAL_MEDIAN={best_med_model}, RMSE_median={best_med_score:,.4f})")
-
+    plt.close("all")
 
 if __name__ == "__main__":
     main()
