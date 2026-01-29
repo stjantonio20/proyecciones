@@ -38,7 +38,7 @@ CSV_PATH = "./dataset/Crediguate_actualizado_mensual.csv"
 OUT_DIR  = "proyeccion_13meses"
 
 H_FUTURE = 13          # 1 año forecast  ESPECIFICA EN MESES LOS QUE QUIERES PREDECIR
-TEST_LEN = 6           # 6 meses test fijo
+TEST_LEN = 3           # 3 meses test fijo
 
 #ONLY_CODIGO = "709110" # o None para todos
 ONLY_CODIGO = None # o None para todos
