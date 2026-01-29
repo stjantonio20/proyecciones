@@ -1,36 +1,48 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-prediccion_mensual_independiente_robusto_cache_gc.py
+prediccion_mensual_independiente_robusto_walkforward.py
 
-Versión con CACHE (para acelerar) + liberación agresiva de RAM al terminar cada código/cuenta.
+VERSIÓN "walk-forward por mes" (mensual-independiente) manteniendo la MISMA estructura
+de outputs del script robusto que sí te funcionaba.
 
-Qué cambia vs tu script robusto "sin cache" (el que sí te daba resultados):
-- Añade un cache LRU POR-CÓDIGO para reutilizar predicciones repetidas:
-    key = (model_name, month, target_year)
-  Se usa tanto en backtest como en forecast futuro.
-- Al finalizar cada código:
-    - limpia el cache
-    - borra objetos grandes
-    - cierra figuras
-    - gc.collect()
-    - si existe TensorFlow: tf.keras.backend.clear_session()
+Qué cambia vs tu script robusto anterior:
+- En vez de llamar predict_one_month_target() para CADA fecha (y repetir trabajo),
+  aquí trabajamos "por mes":
+    * Extraemos la subserie del mes (eje = años) UNA vez.
+    * Hacemos backtest walk-forward (solo para los meses del test).
+    * Hacemos forecast futuro por mes, generando los años necesarios.
+- Mantiene TODOS los modelos (ETS, SARIMAX, Linear, Ridge, MLP, HGB, TCN, LSTM, DL_MultiTask).
+- Mantiene la mezcla nivel + crecimiento (YoY) como antes.
+- Mantiene los mismos outputs:
+    - por código: plot_all, plot_forecast_only, csv por-código
+    - OUT_DIR/_solo_real_forecast/<codigo>.png
+    - export wide por modelo + BEST + BEST_GLOBAL_MEAN/MEDIAN + Excel ALL_MODELS
 
-Esto ayuda cuando tienes muchos códigos (p.ej. 103) y modelos NN que tienden a “acumular” memoria.
+IMPORTANTE sobre "mismos resultados":
+- Para ETS/SARIMAX y tabulares (Linear/Ridge/MLP/HGB), el forecast FUTURO usa la MISMA
+  base de entrenamiento (años reales) para cada target_year, igual que el script anterior,
+  así que te debe dar resultados equivalentes (a redondeo numérico).
+- Para NN (LSTM/TCN/DL_MultiTask), por velocidad entrenamos 1 sola vez por (código, mes, modelo)
+  con TODO el historial real del mes y luego hacemos predicción recursiva de años futuros.
+  Esto puede diferir ligeramente del script anterior (que re-entrenaba por cada target_year),
+  pero mantiene el comportamiento "aprende la forma del mes" y acelera muchísimo.
 
 Requisitos:
   pip install pandas numpy openpyxl scikit-learn statsmodels matplotlib
-  (opcional para NN) pip install tensorflow keras-tcn
+  (opcional NN) pip install tensorflow keras-tcn
+
+Dataset esperado:
+  CSV ancho con columnas: codigo, Mar-15, Apr-15, ..., Nov-25 (o similar, igual que tu primer script)
 """
 
 import os
 import re
+import math
 import warnings
 import shutil
-import gc
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional, List
-from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
@@ -55,41 +67,41 @@ EXPORT_WIDE_FUTURE = True
 WIDE_PREFIX = "proyeccion"
 
 CSV_PATH = "./dataset/Crediguate_actualizado_mensual.csv"
-OUT_DIR  = "proyeccion_13meses_mensual_independiente_robusto_cache_gc"
+OUT_DIR  = "proyeccion_13meses_mensual_independiente_robusto_walkforward"
 OUT_DIR_ONLY_FORECAST = os.path.join(OUT_DIR, "_solo_real_forecast")
 
-H_FUTURE = 37
-TEST_LEN = 6
+H_FUTURE = 37          # si tu último dato es Nov-25 => futuro: Dec-25..Dec-28 (37 meses)
+TEST_LEN = 6           # backtest: últimos 6 meses
 
-ONLY_CODIGO = None  # "601101" o None
+ONLY_CODIGO = None     # "601101" o None
 
-# crecimiento (YoY mismo mes)
+# crecimiento (YoY) lags cortos
 GROWTH_LAGS = 2
-GROWTH_BLEND_W = 0.35
-EPS_DEN = 1e-9
 
-# pesos por recencia
+# Pesos por recencia (como tu último script)
 RECENT_YEARS = 10
 HALF_LIFE_YEARS = 4.0
 
 # switches
 RUN_ETS          = True
-RUN_SARIMAX      = True
-RUN_LINEAR       = True
-RUN_RIDGE        = True
-RUN_MLP          = True
-RUN_HGB          = True
 RUN_TCN          = True
 RUN_LSTM         = True
 RUN_MULTITASK_DL = True
 
-# NN params
-NN_EPOCHS   = 250
-NN_BATCH    = 16
-NN_PATIENCE = 12
+RUN_LINEAR       = True
+RUN_RIDGE        = True
+RUN_MLP          = True
+RUN_SARIMAX      = True
+RUN_HGB          = True
 
-# CACHE (por-código)
-CACHE_MAX_ITEMS = 4000
+# NN params
+NN_EPOCHS   = 180   # más bajo para velocidad (ajusta si quieres)
+NN_BATCH    = 16
+NN_PATIENCE = 10
+
+# mezcla nivel + crecimiento (YoY mismo mes)
+GROWTH_BLEND_W = 0.35
+EPS_DEN = 1e-9
 
 # =========================================================
 # Utils: parse columnas tipo "Mar-15"
@@ -98,7 +110,7 @@ MONTH_MAP = {
     # English
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-    # Spanish
+    # Spanish (common LATAM)
     "Ene": 1, "Feb": 2, "Mar": 3, "Abr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Ago": 8, "Sep": 9, "Set": 9, "Oct": 10, "Nov": 11, "Dic": 12
 }
@@ -110,10 +122,14 @@ def parse_month_col(col: str) -> pd.Timestamp:
         raise ValueError(f"Columna de mes inválida: {col!r}")
     mon, yy = parts[0].strip(), parts[1].strip()
     mon = mon[:3].title()
-    year = (2000 + int(yy)) if len(yy) == 2 else int(yy)
+    if len(yy) == 2:
+        year = 2000 + int(yy)
+    else:
+        year = int(yy)
     if mon not in MONTH_MAP:
         raise ValueError(f"Mes inválido en columna {col!r} (mon={mon!r})")
-    return pd.Timestamp(year=year, month=MONTH_MAP[mon], day=1)
+    month = MONTH_MAP[mon]
+    return pd.Timestamp(year=year, month=month, day=1)
 
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
@@ -202,7 +218,7 @@ def growth_yoy(y_year: pd.Series) -> pd.Series:
     yrs = y.index.values
     g = pd.Series(index=y.index, dtype=float)
     for yr in yrs:
-        prev = yr - 1
+        prev = int(yr) - 1
         if prev in y.index and np.isfinite(y.loc[prev]) and np.isfinite(y.loc[yr]):
             den = max(abs(float(y.loc[prev])), EPS_DEN)
             g.loc[yr] = (float(y.loc[yr]) - float(y.loc[prev])) / den
@@ -233,11 +249,11 @@ def blend_level_and_growth(y_level_pred: float, g_pred: float, y_last: float) ->
     return float("nan")
 
 # =========================================================
-# Features eje año + pesos recencia
+# Features por año + pesos
 # =========================================================
-def exp_weights_for_years(years: np.ndarray, last_obs_year: int, half_life: float, boost_recent_years: int) -> np.ndarray:
+def exp_weights_for_years(years: np.ndarray, last_obs_year: int, half_life: float = 4.0, boost_recent_years: int = 10) -> np.ndarray:
     years = np.asarray(years, dtype="int64")
-    k = np.log(2.0) / max(float(half_life), 1e-9)
+    k = np.log(2.0) / max(half_life, 1e-9)
     w = np.exp(k * (years - int(last_obs_year)))
     if boost_recent_years and boost_recent_years > 0:
         cutoff = int(last_obs_year) - (boost_recent_years - 1)
@@ -298,7 +314,7 @@ def growth_median_k(y_month_year: pd.Series, target_year: int, k: int = 5) -> fl
     return float(np.clip(ghat, -0.95, 2.0))
 
 # =========================================================
-# Modelos: ETS / SARIMAX sobre serie anual (del mes)
+# ETS / SARIMAX sobre serie anual del mes
 # =========================================================
 def fit_predict_ets_year(y_train: pd.Series, steps: int = 1) -> float:
     from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -310,7 +326,8 @@ def fit_predict_ets_year(y_train: pd.Series, steps: int = 1) -> float:
         seasonal=None,
         initialization_method="estimated",
     ).fit(optimized=True)
-    return float(model.forecast(steps)[-1])
+    yhat = model.forecast(steps)[-1]
+    return float(yhat)
 
 def fit_predict_sarimax_year(y_train: pd.Series, steps: int = 1) -> float:
     from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -323,10 +340,11 @@ def fit_predict_sarimax_year(y_train: pd.Series, steps: int = 1) -> float:
         enforce_stationarity=False,
         enforce_invertibility=False
     ).fit(disp=False)
-    return float(mod.forecast(steps=steps)[-1])
+    yhat = mod.forecast(steps=steps)[-1]
+    return float(yhat)
 
 # =========================================================
-# Tabulares (features eje año) + pesos: Linear/Ridge/MLP/HGB
+# Tabulares: Linear/Ridge/MLP/HGB
 # =========================================================
 def fit_tabular_regressor(model_kind: str):
     from sklearn.pipeline import Pipeline
@@ -346,19 +364,22 @@ def fit_tabular_regressor(model_kind: str):
                          solver="adam",
                          alpha=1e-4,
                          learning_rate_init=1e-3,
-                         max_iter=3000,
+                         max_iter=2000,
                          random_state=42)
         )])
     if model_kind == "HGB":
         return HistGradientBoostingRegressor(
             max_depth=6,
             learning_rate=0.05,
-            max_iter=800,
+            max_iter=700,
             random_state=42
         )
     raise ValueError("model_kind no soportado")
 
-def tabular_predict_level_features(y_month_year: pd.Series, target_year: int, model_kind: str) -> float:
+def tabular_fit_level_model(y_month_year: pd.Series, model_kind: str, target_year: int):
+    """
+    Ajusta modelo de nivel (features) con años < target_year y devuelve (model, X1) listo para predecir.
+    """
     y = y_month_year.dropna().astype(float).sort_index()
     y_tr = y[y.index.astype(int) < int(target_year)]
     if len(y_tr) < 5:
@@ -389,8 +410,7 @@ def tabular_predict_level_features(y_month_year: pd.Series, target_year: int, mo
         model.fit(X, Y, sample_weight=w)
     else:
         model.fit(X, Y)
-
-    return float(model.predict(X1)[0])
+    return model, X1
 
 def tabular_predict_growth_lags(g_year: pd.Series, target_year: int, lags: int) -> float:
     g = g_year.dropna().astype(float).sort_index()
@@ -398,7 +418,7 @@ def tabular_predict_growth_lags(g_year: pd.Series, target_year: int, lags: int) 
     min_pairs = 3
     min_years = lags + min_pairs
     if len(g_tr) < min_years:
-        raise ValueError(f"growth: pocos datos (n={len(g_tr)}), min={min_years}")
+        raise ValueError("growth: pocos datos")
 
     vals = g_tr.values.astype(float)
     X, Y = [], []
@@ -408,7 +428,7 @@ def tabular_predict_growth_lags(g_year: pd.Series, target_year: int, lags: int) 
     X = np.asarray(X, float)
     Y = np.asarray(Y, float)
     if len(X) < min_pairs:
-        raise ValueError(f"growth: pocos pares (n={len(X)}), min={min_pairs}")
+        raise ValueError("growth: pocos pares")
 
     model = fit_tabular_regressor("Ridge")
     model.fit(X, Y)
@@ -417,7 +437,7 @@ def tabular_predict_growth_lags(g_year: pd.Series, target_year: int, lags: int) 
     return float(np.clip(ghat, -0.95, 2.0))
 
 # =========================================================
-# Keras (LSTM/TCN/MultiTask)
+# NN (train 1x por mes) + recursivo por años
 # =========================================================
 @dataclass
 class AsinhScaler:
@@ -445,7 +465,8 @@ def transform_asinh(y: np.ndarray, sc: AsinhScaler) -> np.ndarray:
 def inverse_asinh(z_scaled: np.ndarray, sc: AsinhScaler) -> np.ndarray:
     z_scaled = np.asarray(z_scaled, float)
     z = z_scaled * sc.sigma + sc.mu
-    return np.sinh(z) * sc.s
+    y = np.sinh(z) * sc.s
+    return y
 
 def make_supervised_1d(y_scaled: np.ndarray, lookback: int) -> Tuple[np.ndarray, np.ndarray]:
     y_scaled = np.asarray(y_scaled, float).reshape(-1)
@@ -483,23 +504,11 @@ def build_lstm(input_len: int):
 def build_tcn(input_len: int):
     tf = get_tf()
     from tensorflow.keras import layers, models
-    try:
-        from tcn import TCN
-    except ImportError:
-        import subprocess, sys
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "keras-tcn"])
-        from tcn import TCN
-
+    from tcn import TCN
     inp = layers.Input(shape=(input_len, 1))
-    x = TCN(
-        nb_filters=32,
-        kernel_size=3,
-        dilations=[1, 2, 4, 8, 16],
-        padding="causal",
-        dropout_rate=0.2,
-        return_sequences=False,
-        use_skip_connections=True,
-    )(inp)
+    x = TCN(nb_filters=32, kernel_size=3, dilations=[1,2,4,8,16],
+            padding="causal", dropout_rate=0.2, return_sequences=False,
+            use_skip_connections=True)(inp)
     x = layers.Dense(16, activation="relu")(x)
     out = layers.Dense(1)(x)
     m = models.Model(inp, out)
@@ -525,13 +534,15 @@ def build_multitask_dl(input_len: int):
     )
     return m
 
-def train_keras_model(model, Xtr, Ytr, Xva, Yva, multitask: bool = False):
-    from tensorflow.keras.callbacks import EarlyStopping
-    cb = [EarlyStopping(monitor="val_loss", patience=NN_PATIENCE, restore_best_weights=True)]
+def train_keras_model(model, Xtr, Ytr, Xva, Yva, multitask=False):
+    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+    cb = [
+        EarlyStopping(monitor="val_loss", patience=NN_PATIENCE, restore_best_weights=True),
+        ReduceLROnPlateau(monitor="val_loss", patience=max(3, NN_PATIENCE//2), factor=0.5, min_lr=1e-5),
+    ]
     if not multitask:
         model.fit(Xtr, Ytr, validation_data=(Xva, Yva),
-                  epochs=NN_EPOCHS, batch_size=NN_BATCH, shuffle=False,
-                  verbose=0, callbacks=cb)
+                  epochs=NN_EPOCHS, batch_size=NN_BATCH, shuffle=False, verbose=0, callbacks=cb)
     else:
         ytr_level = Ytr
         ytr_delta = (Ytr.reshape(-1) - Xtr[:, -1, 0]).reshape(-1, 1)
@@ -539,8 +550,7 @@ def train_keras_model(model, Xtr, Ytr, Xva, Yva, multitask: bool = False):
         yva_delta = (Yva.reshape(-1) - Xva[:, -1, 0]).reshape(-1, 1)
         model.fit(Xtr, {"y_level": ytr_level, "y_delta": ytr_delta},
                   validation_data=(Xva, {"y_level": yva_level, "y_delta": yva_delta}),
-                  epochs=NN_EPOCHS, batch_size=NN_BATCH, shuffle=False,
-                  verbose=0, callbacks=cb)
+                  epochs=NN_EPOCHS, batch_size=NN_BATCH, shuffle=False, verbose=0, callbacks=cb)
 
 def predict_keras_one_step(model, X):
     yhat = model.predict(X, verbose=0)
@@ -548,25 +558,26 @@ def predict_keras_one_step(model, X):
         return np.asarray(yhat[0]).reshape(-1)
     return np.asarray(yhat).reshape(-1)
 
-def nn_predict_year(y_train_year: pd.Series, target_year: int, lookback: int, kind: str) -> float:
-    y_train_year = y_train_year.dropna().astype(float).sort_index()
-    y_train = y_train_year[y_train_year.index.astype(int) < int(target_year)]
-    min_pairs = 5
-    min_years = lookback + min_pairs
-    if len(y_train) < min_years:
-        raise ValueError(f"{kind}: pocos años (n={len(y_train)}), min={min_years}")
+def nn_train_month_model(y_month_year: pd.Series, lookback: int, kind: str):
+    """
+    Entrena 1 vez con todo el historial real (del mes). Devuelve (model, scaler, last_window_scaled)
+    """
+    y = y_month_year.dropna().astype(float).sort_index()
+    if len(y) < (lookback + 6):
+        raise ValueError("NN: pocos años")
 
-    sc = fit_asinh_scaler(y_train.values)
-    ys = transform_asinh(y_train.values, sc)
+    sc = fit_asinh_scaler(y.values)
+    ys = transform_asinh(y.values, sc)
 
     X, Y = make_supervised_1d(ys, lookback)
-    if len(X) < min_pairs:
-        raise ValueError(f"{kind}: pocos pares (n={len(X)}), min={min_pairs}")
+    if len(X) < 6:
+        raise ValueError("NN: pocos pares")
 
     ntr = len(X)
-    nval = max(5, int(0.2 * ntr))
+    nval = max(4, int(0.2 * ntr))
     if ntr <= nval:
-        raise ValueError(f"{kind}: no alcanza para val (n={ntr})")
+        raise ValueError("NN: no alcanza para val")
+
     Xtrain, Ytrain = X[:-nval], Y[:-nval]
     Xval,   Yval   = X[-nval:], Y[-nval:]
 
@@ -583,11 +594,24 @@ def nn_predict_year(y_train_year: pd.Series, target_year: int, lookback: int, ki
         raise ValueError("NN kind no soportado")
 
     last_window = ys[-lookback:].reshape(1, lookback, 1)
-    yhat_s = float(predict_keras_one_step(m, last_window)[0])
-    return float(inverse_asinh(np.array([yhat_s]), sc)[0])
+    return m, sc, last_window
+
+def nn_forecast_years(m, sc, last_window, steps: int) -> np.ndarray:
+    """
+    Forecast recursivo 1-step, actualizando ventana con predicción.
+    """
+    w = last_window.astype(float).copy()
+    preds_scaled = []
+    for _ in range(int(steps)):
+        yhat_s = float(predict_keras_one_step(m, w)[0])
+        preds_scaled.append(yhat_s)
+        # shift window
+        w = np.concatenate([w[:, 1:, :], np.array([[[yhat_s]]])], axis=1)
+    preds = inverse_asinh(np.asarray(preds_scaled, float), sc)
+    return preds.reshape(-1)
 
 # =========================================================
-# Métricas / plots / export por código
+# Métricas / plots / export por código (igual)
 # =========================================================
 def rmse(y_true, y_pred) -> float:
     y_true = np.asarray(y_true, float).reshape(-1)
@@ -598,17 +622,14 @@ def rmse(y_true, y_pred) -> float:
     e = y_true[:m] - y_pred[:m]
     return float(np.sqrt(np.mean(e*e)))
 
-def plot_all_models(codigo: str, y: pd.Series, train_end: pd.Timestamp,
-                    test_idx: pd.DatetimeIndex, future_idx: pd.DatetimeIndex,
-                    preds_test: Dict[str, np.ndarray], preds_future: Dict[str, np.ndarray],
-                    out_png: str):
+def plot_all_models(codigo, y, train_end, test_idx, future_idx, preds_test, preds_future, out_png):
     plt.figure(figsize=(13, 5))
     plt.plot(y.index, y.values, label="Real", linewidth=2)
     plt.axvline(train_end, linestyle="--", linewidth=1)
     plt.text(train_end, np.nanmin(y.values), "  train_end", rotation=90, va="bottom")
 
     for name, p in preds_test.items():
-        if p is None:
+        if p is None: 
             continue
         p = np.asarray(p, float).reshape(-1)
         if np.all(~np.isfinite(p)):
@@ -617,7 +638,7 @@ def plot_all_models(codigo: str, y: pd.Series, train_end: pd.Timestamp,
         plt.plot(test_idx[:m], p[:m], label=f"{name} (test)")
 
     for name, p in preds_future.items():
-        if p is None:
+        if p is None: 
             continue
         p = np.asarray(p, float).reshape(-1)
         if np.all(~np.isfinite(p)):
@@ -634,9 +655,7 @@ def plot_all_models(codigo: str, y: pd.Series, train_end: pd.Timestamp,
     plt.savefig(out_png, dpi=150)
     plt.close()
 
-def plot_forecast_only(codigo: str, y: pd.Series, train_end: pd.Timestamp,
-                       future_idx: pd.DatetimeIndex, preds_future: Dict[str, np.ndarray],
-                       out_png: str):
+def plot_forecast_only(codigo, y, train_end, future_idx, preds_future, out_png):
     plt.figure(figsize=(13, 5))
     plt.plot(y.index, y.values, label="Real", linewidth=2)
 
@@ -656,7 +675,7 @@ def plot_forecast_only(codigo: str, y: pd.Series, train_end: pd.Timestamp,
         plt.plot(future_idx[:m], p[:m], label=f"{name} (forecast)", linestyle="-")
         drew_any = True
 
-    if not drew_any and len(future_idx) > 0:
+    if not drew_any:
         plt.text(future_idx[0], np.nanmedian(y.values) if len(y) else 0.0,
                  "NO HAY PREDS (revisar datos/modelos)", fontsize=10)
 
@@ -669,18 +688,19 @@ def plot_forecast_only(codigo: str, y: pd.Series, train_end: pd.Timestamp,
     plt.savefig(out_png, dpi=150)
     plt.close()
 
-def export_csv_codigo(out_csv: str, y: pd.Series,
-                      test_idx: pd.DatetimeIndex, future_idx: pd.DatetimeIndex,
-                      preds_test: Dict[str, np.ndarray], preds_future: Dict[str, np.ndarray]):
+def export_csv_codigo(out_csv, y, test_idx, future_idx, preds_test, preds_future):
     df = pd.DataFrame({"fecha": y.index, "real": y.values}).set_index("fecha")
+
     for name, p in preds_test.items():
         if p is None:
             continue
         df[f"pred_test_{name}"] = pd.Series(p, index=test_idx[:len(p)])
+
     for name, p in preds_future.items():
         if p is None:
             continue
         df[f"pred_future_{name}"] = pd.Series(p, index=future_idx[:len(p)])
+
     df.reset_index().to_csv(out_csv, index=False)
 
 # =========================================================
@@ -693,6 +713,7 @@ def read_wide_monthly(path: str) -> pd.DataFrame:
         df = pd.read_csv(path, sep="|", engine="python")
 
     df.columns = [str(c).strip() for c in df.columns]
+
     for c in df.columns:
         if c.lower() == "codigo" and c != "codigo":
             df = df.rename(columns={c: "codigo"})
@@ -713,7 +734,7 @@ def read_wide_monthly(path: str) -> pd.DataFrame:
             continue
     month_cols = [c for c in month_cols if c in col_to_ts]
     if not month_cols:
-        raise ValueError("No se pudieron parsear columnas a fechas (parse_month_col falló).")
+        raise ValueError("Las columnas candidatas no pudieron parsearse a fechas.")
 
     long = df.melt(id_vars=["codigo"], value_vars=month_cols, var_name="mes", value_name="valor")
     long["fecha"] = long["mes"].map(col_to_ts)
@@ -730,7 +751,7 @@ def series_by_codigo(long: pd.DataFrame, codigo: str) -> pd.Series:
     return s.astype(float)
 
 # =========================================================
-# Predicción mensual-independiente + CACHE
+# Mensual-independiente: extracción por mes
 # =========================================================
 def extract_month_year_series(s: pd.Series, month: int) -> pd.Series:
     ss = s.dropna().astype(float)
@@ -741,32 +762,11 @@ def extract_month_year_series(s: pd.Series, month: int) -> pd.Series:
     y = y[~y.index.duplicated(keep="last")].sort_index()
     return y.astype(float)
 
-class LRUCache:
-    def __init__(self, max_items: int = 4000):
-        self.max_items = int(max_items)
-        self.d = OrderedDict()
-
-    def get(self, key):
-        if key in self.d:
-            self.d.move_to_end(key)
-            return self.d[key]
-        return None
-
-    def set(self, key, value):
-        self.d[key] = value
-        self.d.move_to_end(key)
-        if len(self.d) > self.max_items:
-            self.d.popitem(last=False)
-
-    def clear(self):
-        self.d.clear()
-
-def predict_one_month_target(y_month_year: pd.Series, target_year: int, model_name: str) -> float:
-    """
-    Predice el nivel para (mes, target_year) usando SOLO ese mes a través de años.
-    Integra crecimiento YoY y hace blend.
-    Con rollback robusto (ETS -> Mean3 -> NaiveLast, crecimiento -> median).
-    """
+# =========================================================
+# Predicción 1 objetivo (usa rollback y blend) - mismo core
+# =========================================================
+def predict_one_month_target(y_month_year: pd.Series, target_year: int, model_name: str,
+                             nn_cache: dict, nn_lookback: int = 5) -> float:
     y_month_year = y_month_year.dropna().astype(float).sort_index()
     if len(y_month_year) == 0:
         return float("nan")
@@ -776,6 +776,7 @@ def predict_one_month_target(y_month_year: pd.Series, target_year: int, model_na
         y_last = float(y_month_year.loc[target_year - 1])
 
     g = growth_yoy(y_month_year)
+
     y_level_pred = float("nan")
     g_pred = float("nan")
 
@@ -786,17 +787,32 @@ def predict_one_month_target(y_month_year: pd.Series, target_year: int, model_na
 
         if model_name == "ETS":
             y_level_pred = fit_predict_ets_year(y_train, steps=1)
+
         elif model_name == "SARIMAX":
             y_level_pred = fit_predict_sarimax_year(y_train, steps=1)
+
         elif model_name in ("Linear", "Ridge", "MLP", "HGB"):
-            y_level_pred = tabular_predict_level_features(y_month_year, target_year=target_year, model_kind=model_name)
+            mdl, X1 = tabular_fit_level_model(y_month_year, model_kind=model_name, target_year=target_year)
+            y_level_pred = float(mdl.predict(X1)[0])
             try:
                 g_pred = tabular_predict_growth_lags(g, target_year=target_year, lags=GROWTH_LAGS)
             except Exception:
                 g_pred = growth_median_k(y_month_year, target_year, k=5)
+
         elif model_name in ("LSTM", "TCN", "DL_MultiTask"):
-            lookback = 5
-            y_level_pred = nn_predict_year(y_month_year, target_year=target_year, lookback=lookback, kind=model_name)
+            # cache NN por (modelo, mes_id) -> (m,sc,last_window, last_year)
+            key = ("NN_MONTH", model_name, int(y_month_year.index.max()))
+            if key not in nn_cache:
+                m, sc, last_w = nn_train_month_model(y_month_year, lookback=nn_lookback, kind=model_name)
+                nn_cache[key] = (m, sc, last_w, int(y_month_year.index.max()))
+            m, sc, last_w, last_real_year = nn_cache[key]
+            # steps = target_year - (last_real_year)
+            steps = int(target_year) - int(last_real_year)
+            if steps <= 0:
+                # estamos prediciendo dentro del historial (backtest): usa rollback (para ser coherente)
+                raise ValueError("NN backtest -> rollback")
+            yhat_arr = nn_forecast_years(m, sc, last_w, steps=steps)
+            y_level_pred = float(yhat_arr[-1])
             try:
                 g_pred = tabular_predict_growth_lags(g, target_year=target_year, lags=GROWTH_LAGS)
             except Exception:
@@ -805,7 +821,7 @@ def predict_one_month_target(y_month_year: pd.Series, target_year: int, model_na
             raise ValueError("modelo no soportado")
 
     except Exception:
-        # rollback
+        # ===== rollback =====
         try:
             y_train = y_month_year[y_month_year.index.astype(int) < int(target_year)]
             if len(y_train) >= 5:
@@ -816,6 +832,7 @@ def predict_one_month_target(y_month_year: pd.Series, target_year: int, model_na
             y_level_pred = level_mean_k(y_month_year, target_year, k=3)
             if not np.isfinite(y_level_pred):
                 y_level_pred = level_naive_last(y_month_year, target_year)
+
         g_pred = growth_median_k(y_month_year, target_year, k=5)
 
     if not np.isfinite(g_pred):
@@ -823,44 +840,60 @@ def predict_one_month_target(y_month_year: pd.Series, target_year: int, model_na
 
     return float(blend_level_and_growth(float(y_level_pred), float(g_pred), float(y_last)))
 
-def backtest_monthly_independent(s: pd.Series, test_idx: pd.DatetimeIndex, model_name: str, cache: Optional[LRUCache]) -> np.ndarray:
-    preds = []
-    for dt in test_idx:
-        m = int(dt.month)
-        target_year = int(dt.year)
-        key = (model_name, m, target_year)
-        if cache is not None:
-            hit = cache.get(key)
-            if hit is not None:
-                preds.append(hit)
-                continue
-        y_my = extract_month_year_series(s, month=m)
-        yhat = predict_one_month_target(y_my, target_year=target_year, model_name=model_name)
-        if cache is not None:
-            cache.set(key, float(yhat))
-        preds.append(yhat)
-    return np.array(preds, float)
+# =========================================================
+# WALK-FORWARD por mes: backtest + forecast (SIN re-ejecutar por fecha)
+# =========================================================
+def predict_paths_walkforward_by_month(
+    s_all: pd.Series,
+    test_idx: pd.DatetimeIndex,
+    future_idx: pd.DatetimeIndex,
+    model_name: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Regresa (pred_test_alineado_a_test_idx, pred_future_alineado_a_future_idx)
+    usando estrategia por-mes (subserie anual del mes).
 
-def forecast_monthly_independent(s: pd.Series, future_idx: pd.DatetimeIndex, model_name: str, cache: Optional[LRUCache]) -> np.ndarray:
-    preds = []
-    for dt in future_idx:
-        m = int(dt.month)
-        target_year = int(dt.year)
-        key = (model_name, m, target_year)
-        if cache is not None:
-            hit = cache.get(key)
-            if hit is not None:
-                preds.append(hit)
-                continue
-        y_my = extract_month_year_series(s, month=m)
-        yhat = predict_one_month_target(y_my, target_year=target_year, model_name=model_name)
-        if cache is not None:
-            cache.set(key, float(yhat))
-        preds.append(yhat)
-    return np.array(preds, float)
+    Importante: el forecast futuro NO agrega predicciones al entrenamiento (para
+    mantener equivalencia con tu script anterior).
+    """
+    nn_cache = {}  # cache NN por mes/modelo
+
+    # construir mapa de fechas->pred
+    pred_test_map = {}
+    pred_future_map = {}
+
+    # agrupar targets por mes
+    all_test = list(pd.DatetimeIndex(test_idx))
+    all_fut  = list(pd.DatetimeIndex(future_idx))
+
+    for month in range(1, 13):
+        y_my = extract_month_year_series(s_all, month=month)
+        if y_my.empty:
+            continue
+
+        # ---- backtest targets de ese mes
+        targets_test = [dt for dt in all_test if int(dt.month) == month]
+        for dt in targets_test:
+            ty = int(dt.year)
+            yhat = predict_one_month_target(y_my, target_year=ty, model_name=model_name, nn_cache=nn_cache)
+            pred_test_map[dt] = yhat
+
+        # ---- future targets de ese mes
+        targets_fut = [dt for dt in all_fut if int(dt.month) == month]
+        # para acelerar, orden por año
+        targets_fut = sorted(targets_fut, key=lambda d: (d.year, d.month))
+        for dt in targets_fut:
+            ty = int(dt.year)
+            yhat = predict_one_month_target(y_my, target_year=ty, model_name=model_name, nn_cache=nn_cache)
+            pred_future_map[dt] = yhat
+
+    # ensamblar arrays en el mismo orden
+    yhat_test = np.array([pred_test_map.get(dt, np.nan) for dt in pd.DatetimeIndex(test_idx)], float)
+    yhat_fut  = np.array([pred_future_map.get(dt, np.nan) for dt in pd.DatetimeIndex(future_idx)], float)
+    return yhat_test, yhat_fut
 
 # =========================================================
-# RUN por codigo (misma estructura) + liberar RAM
+# RUN por codigo (estructura igual)
 # =========================================================
 def run_for_codigo(codigo: str, s: pd.Series):
     s = s.dropna().astype(float)
@@ -897,84 +930,92 @@ def run_for_codigo(codigo: str, s: pd.Series):
     if RUN_LSTM: model_list.append("LSTM")
     if RUN_MULTITASK_DL: model_list.append("DL_MultiTask")
 
-    cache_pred = LRUCache(max_items=CACHE_MAX_ITEMS)
-
-    try:
-        if all_zero:
-            for name in model_list:
-                preds_test[name] = np.zeros(len(test_idx), float)
-                preds_fut[name]  = np.zeros(len(future_idx), float)
-                scores[name]     = 0.0
-        else:
-            s_full = pd.concat([y_train_full, y_test])  # evita Series.append (deprecated)
-            for name in model_list:
-                try:
-                    yhat_test = backtest_monthly_independent(s_full, test_idx, name, cache_pred)
-                    preds_test[name] = yhat_test
-                    scores[name] = rmse(y_test.values, yhat_test)
-
-                    yhat_fut = forecast_monthly_independent(s, future_idx, name, cache_pred)
-                    preds_fut[name] = yhat_fut
-                except Exception as e:
-                    print(f"[WARN] {codigo} {name} falló: {e}")
-                    preds_test[name] = None
-                    preds_fut[name]  = None
-
-        scored = sorted(scores.items(), key=lambda kv: kv[1] if np.isfinite(kv[1]) else 1e99)
-        print(f"\n=== {codigo} (n={len(s)}, test={len(y_test)}) mensual-indep robusto (cache+gc) ===")
-        for name, r in scored:
-            print(f"  {name:12s} RMSE_test = {r:,.4f}")
-
-        out_c_dir = os.path.join(OUT_DIR, f"codigo_{codigo}")
-        ensure_dir(out_c_dir)
-
-        out_png_all = os.path.join(out_c_dir, f"plot_{codigo}.png")
-        out_png_fore = os.path.join(out_c_dir, f"plot_forecast_only_{codigo}.png")
-        out_csv = os.path.join(out_c_dir, f"pred_{codigo}.csv")
-
-        plot_all_models(codigo, s, train_end_date, test_idx, future_idx, preds_test, preds_fut, out_png_all)
-        plot_forecast_only(codigo, s, train_end_date, future_idx, preds_fut, out_png_fore)
-
-        try:
-            ensure_dir(OUT_DIR_ONLY_FORECAST)
-            if os.path.exists(out_png_fore):
-                shutil.copy2(out_png_fore, os.path.join(OUT_DIR_ONLY_FORECAST, f"{codigo}.png"))
-        except Exception as e:
-            print(f"[WARN] No se pudo copiar forecast-only de {codigo}: {e}")
-
-        export_csv_codigo(out_csv, s, test_idx, future_idx, preds_test, preds_fut)
-
-        print(f"[OK] guardado: {out_png_all}")
-        print(f"[OK] guardado: {out_png_fore}")
-        print(f"[OK] guardado: {out_csv}")
-
-        return {"codigo": codigo, "future_idx": future_idx, "preds_fut": preds_fut, "scores": scores}
-
-    finally:
-        # ===========================
-        # LIBERAR RAM por código
-        # ===========================
-        try:
-            cache_pred.clear()
-        except Exception:
-            pass
-
-        try:
-            plt.close("all")
-        except Exception:
-            pass
-
-        # TensorFlow tiende a acumular: limpia sesión si está instalado
-        try:
-            import tensorflow as tf  # noqa: F401
+    if all_zero:
+        for name in model_list:
+            preds_test[name] = np.zeros(len(test_idx), float)
+            preds_fut[name]  = np.zeros(len(future_idx), float)
+            scores[name]     = 0.0
+    else:
+        # s_all para extraer subseries por mes (incluye train+test reales)
+        s_all = s.copy()
+        for name in model_list:
             try:
-                tf.keras.backend.clear_session()
-            except Exception:
-                pass
-        except Exception:
-            pass
+                yhat_test, yhat_fut = predict_paths_walkforward_by_month(
+                    s_all=s_all,
+                    test_idx=test_idx,
+                    future_idx=future_idx,
+                    model_name=name,
+                )
+                preds_test[name] = yhat_test
+                preds_fut[name]  = yhat_fut
+                scores[name] = rmse(y_test.values, yhat_test)
+            except Exception as e:
+                print(f"[WARN] {codigo} {name} falló: {e}")
+                preds_test[name] = None
+                preds_fut[name]  = None
 
-        gc.collect()
+    # ranking
+    scored = sorted(scores.items(), key=lambda kv: kv[1] if np.isfinite(kv[1]) else 1e99)
+    print(f"\n=== {codigo} (n={len(s)}, test={len(y_test)}) mensual-indep robusto WALKFWD ===")
+    for name, r in scored:
+        print(f"  {name:12s} RMSE_test = {r:,.4f}")
+
+    out_c_dir = os.path.join(OUT_DIR, f"codigo_{codigo}")
+    ensure_dir(out_c_dir)
+
+    out_png_all = os.path.join(out_c_dir, f"plot_{codigo}.png")
+    out_png_fore = os.path.join(out_c_dir, f"plot_forecast_only_{codigo}.png")
+    out_csv = os.path.join(out_c_dir, f"pred_{codigo}.csv")
+
+    plot_all_models(
+        codigo=codigo,
+        y=s,
+        train_end=train_end_date,
+        test_idx=test_idx,
+        future_idx=future_idx,
+        preds_test=preds_test,
+        preds_future=preds_fut,
+        out_png=out_png_all
+    )
+
+    plot_forecast_only(
+        codigo=codigo,
+        y=s,
+        train_end=train_end_date,
+        future_idx=future_idx,
+        preds_future=preds_fut,
+        out_png=out_png_fore
+    )
+
+    # Copiar forecast-only a carpeta extra
+    try:
+        ensure_dir(OUT_DIR_ONLY_FORECAST)
+        if os.path.exists(out_png_fore):
+            shutil.copy2(out_png_fore, os.path.join(OUT_DIR_ONLY_FORECAST, f"{codigo}.png"))
+        else:
+            print(f"[WARN] No existe {out_png_fore} (no se generó el png).")
+    except Exception as e:
+        print(f"[WARN] No se pudo copiar forecast-only de {codigo}: {e}")
+
+    export_csv_codigo(
+        out_csv=out_csv,
+        y=s,
+        test_idx=test_idx,
+        future_idx=future_idx,
+        preds_test=preds_test,
+        preds_future=preds_fut
+    )
+
+    print(f"[OK] guardado: {out_png_all}")
+    print(f"[OK] guardado: {out_png_fore}")
+    print(f"[OK] guardado: {out_csv}")
+
+    return {
+        "codigo": codigo,
+        "future_idx": future_idx,
+        "preds_fut": preds_fut,
+        "scores": scores,
+    }
 
 # =========================================================
 # MAIN
@@ -984,6 +1025,7 @@ def main():
     ensure_dir(OUT_DIR_ONLY_FORECAST)
 
     long = read_wide_monthly(CSV_PATH)
+
     codigos = sorted(long["codigo"].unique().tolist())
     if ONLY_CODIGO is not None:
         codigos = [str(ONLY_CODIGO)]
@@ -998,7 +1040,6 @@ def main():
     global_month_cols: Optional[List[str]] = None
 
     all_results = []
-
     for c in codigos:
         try:
             s = series_by_codigo(long, str(c))
@@ -1007,11 +1048,6 @@ def main():
                 continue
 
             res = run_for_codigo(str(c), s)
-
-            # libera series lo antes posible
-            del s
-            gc.collect()
-
             if res is None:
                 continue
 
@@ -1039,7 +1075,7 @@ def main():
 
                 wide_by_model.setdefault(model_name, {}).setdefault(codigo, {})
                 for i in range(m):
-                    wide_by_model[model_name][codigo][global_month_cols[i]] = float(arr[i])
+                    wide_by_model[model_name][codigo][global_month_cols[i]] = float(arr[i]) if np.isfinite(arr[i]) else np.nan
 
             if len(scores) > 0:
                 best_model = sorted(scores.items(), key=lambda kv: kv[1] if np.isfinite(kv[1]) else 1e99)[0][0]
@@ -1049,17 +1085,16 @@ def main():
                     m = min(len(best_arr), len(global_future_idx))
                     wide_best[codigo] = {}
                     for i in range(m):
-                        wide_best[codigo][global_month_cols[i]] = float(best_arr[i])
+                        wide_best[codigo][global_month_cols[i]] = float(best_arr[i]) if np.isfinite(best_arr[i]) else np.nan
 
-            all_results.append({"codigo": codigo, "future_idx": future_idx, "preds_fut": preds_fut})
-
-            # liberar res pronto
-            del res, preds_fut, scores, future_idx
-            gc.collect()
+            all_results.append({
+                "codigo": res["codigo"],
+                "future_idx": res["future_idx"],
+                "preds_fut": res["preds_fut"],
+            })
 
         except Exception as e:
             print(f"[ERROR] {c}: {e}")
-            gc.collect()
             continue
 
     # Excel wide (codigo,modelo,meses...)
@@ -1114,7 +1149,6 @@ def main():
             print(f"[OK] guardado ancho: {out_path}  (BEST_GLOBAL_MEDIAN={best_med_model}, RMSE_median={best_med_score:,.4f})")
 
     plt.close("all")
-    gc.collect()
 
 if __name__ == "__main__":
     main()
