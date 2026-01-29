@@ -70,11 +70,11 @@ def main():
     raiz = Path.cwd()
 
     # Orígenes
-    src_36m = raiz / "outputs_modelos_36meses"
-    src_1y  = raiz / "outputs_modelos_extra"
+    src_36m = raiz / "proyeccion_13meses"
+    src_1y  = raiz / "proyeccion_37meses"
 
     # Destinos
-    base_dst = raiz / "proyeccion12mesesy36meses"
+    base_dst = raiz / "proyeccion_13mesesy37meses"
     dst_3y = base_dst / "proyeccion_3anios"
     dst_1y_dst = base_dst / "proyeccion_1anio"
 
