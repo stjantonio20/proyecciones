@@ -908,28 +908,56 @@ def backtest_monthly_independent(
     s: pd.Series,
     test_idx: pd.DatetimeIndex,
     model_name: str,
+    cache_pred: dict,
 ) -> np.ndarray:
     preds = []
     for dt in test_idx:
         m = int(dt.month)
-        y_my = extract_month_year_series(s, month=m)
         target_year = int(dt.year)
-        yhat = predict_one_month_target(y_my, target_year=target_year, model_name=model_name)
+        key = (model_name, m, target_year)
+
+        if key in cache_pred:
+            preds.append(cache_pred[key])
+            continue
+
+        y_my = extract_month_year_series(s, month=m)
+        yhat = predict_one_month_target(
+            y_my,
+            target_year=target_year,
+            model_name=model_name,
+        )
+
+        cache_pred[key] = yhat
         preds.append(yhat)
+
     return np.array(preds, float)
 
 def forecast_monthly_independent(
     s: pd.Series,
     future_idx: pd.DatetimeIndex,
     model_name: str,
+    cache_pred:dict,
 ) -> np.ndarray:
     preds = []
     for dt in future_idx:
         m = int(dt.month)
-        y_my = extract_month_year_series(s, month=m)
         target_year = int(dt.year)
-        yhat = predict_one_month_target(y_my, target_year=target_year, model_name=model_name)
+        key = (model_name, m, target_year)
+
+        if key in cache_pred:
+            preds.append(cache_pred[key])
+            continue
+
+        y_my = extract_month_year_series(s, month=m)
+        yhat = predict_one_month_target(
+            y_my,
+            target_year=target_year,
+            model_name=model_name,
+        )
+
+        cache_pred[key] = yhat
         preds.append(yhat)
+
     return np.array(preds, float)
 
 # =========================================================
@@ -977,6 +1005,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
             preds_fut[name]  = np.zeros(len(future_idx), float)
             scores[name]     = 0.0
     else:
+        cache_pred = {}  # (model_name, month, target_year) -> yhat
         for name in model_list:
             try:
                 # backtest: cada mes del test se predice por su mes-del-año
@@ -984,6 +1013,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
                     s=pd.concat([y_train_full, y_test]),
                     test_idx=test_idx,
                     model_name=name,
+                    cache_pred=cache_pred #para evitar reentrenar
                 )
                 preds_test[name] = yhat_test
                 scores[name] = rmse(y_test.values, yhat_test)
@@ -993,6 +1023,7 @@ def run_for_codigo(codigo: str, s: pd.Series):
                     s=s,
                     future_idx=future_idx,
                     model_name=name,
+                    cache_pred=cache_pred,
                 )
                 preds_fut[name] = yhat_fut
             except Exception as e:

@@ -40,17 +40,17 @@ OUT_DIR  = "proyeccion_13meses"
 H_FUTURE = 13          # 1 año forecast  ESPECIFICA EN MESES LOS QUE QUIERES PREDECIR
 TEST_LEN = 6           # 6 meses test fijo
 
-#ONLY_CODIGO = "709110" # o None para todos
-ONLY_CODIGO = None # o None para todos
+ONLY_CODIGO = "601101" # o None para todos
+#ONLY_CODIGO = None # o None para todos
 
 LOOKBACK_NN  = 16      # para LSTM/TCN
 LAGS_TABULAR = 28      # para Linear/Ridge/MLP/HGB (roll lags)
 
 # switches
-RUN_ETS          = True
-RUN_TCN          = True
-RUN_LSTM         = True
-RUN_MULTITASK_DL = True
+RUN_ETS          = False
+RUN_TCN          = False
+RUN_LSTM         = False
+RUN_MULTITASK_DL = False
 
 RUN_LINEAR       = True
 RUN_RIDGE        = True
